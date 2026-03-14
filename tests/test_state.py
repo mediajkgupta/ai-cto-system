@@ -29,3 +29,13 @@ def test_initial_state_is_dict():
 def test_initial_state_current_task_index():
     state = initial_state("Some idea", "proj")
     assert state["current_task_index"] == 0
+
+
+def test_initial_state_v2_fields():
+    state = initial_state("Some idea", "proj")
+    assert state["completed_task_ids"] == []
+    assert state["failed_task_ids"] == []
+    assert state["blocked_task_ids"] == []
+    assert state["task_history"] == []
+    assert state["project_status"] == "active"
+    assert state["active_task_id"] is None

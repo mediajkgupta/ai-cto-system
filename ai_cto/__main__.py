@@ -22,7 +22,8 @@ def main() -> None:
     )
     parser.add_argument(
         "idea",
-        help="Describe the software you want to build.",
+        nargs="?",
+        help="Describe the software you want to build. Not required when using --resume.",
     )
     parser.add_argument(
         "--id",
@@ -31,11 +32,25 @@ def main() -> None:
         help="Project slug used for the workspace directory (auto-generated if omitted).",
     )
     parser.add_argument(
+        "--resume",
+        dest="resume_project_id",
+        default=None,
+        metavar="PROJECT_ID",
+        help=(
+            "Resume an interrupted project by reading its task_board.json. "
+            "The idea argument is not required when resuming."
+        ),
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable debug logging.",
     )
     args = parser.parse_args()
+
+    # Validate: need either idea or --resume
+    if not args.resume_project_id and not args.idea:
+        parser.error("the following arguments are required: idea (or use --resume PROJECT_ID)")
 
     # Configure logging
     level = logging.DEBUG if args.verbose else logging.INFO
@@ -45,19 +60,23 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    # Derive project_id from idea if not provided
-    project_id = args.project_id or _slugify(args.idea)
+    if args.resume_project_id:
+        _run_resume(args.resume_project_id)
+    else:
+        project_id = args.project_id or _slugify(args.idea)
+        _run_new(args.idea, project_id)
 
-    # Lazy import to avoid loading heavy deps before env is configured
+
+def _run_new(idea: str, project_id: str) -> None:
     from ai_cto.state import initial_state
     from ai_cto.graph import build_graph
 
     print(f"\n{'='*60}")
     print(f"  AI CTO System — Project: {project_id}")
-    print(f"  Idea: {args.idea}")
+    print(f"  Idea: {idea}")
     print(f"{'='*60}\n")
 
-    state = initial_state(idea=args.idea, project_id=project_id)
+    state = initial_state(idea=idea, project_id=project_id)
     graph = build_graph()
 
     # Stream events so the user sees progress in real time
@@ -75,6 +94,52 @@ def main() -> None:
         print(final.get("final_output", ""))
     else:
         print("FAILED")
+        print(final.get("final_output", "No output available."))
+    print(f"{'='*60}\n")
+
+    sys.exit(0 if final.get("status") == "done" else 1)
+
+
+def _run_resume(resume_project_id: str) -> None:
+    from pathlib import Path
+    import ai_cto.tools.file_writer as _fw
+    from ai_cto.tools.task_board import resume_state_from_board
+    from ai_cto.graph import build_resume_graph
+
+    board_path = _fw.WORKSPACE_ROOT / resume_project_id / "task_board.json"
+
+    print(f"\n{'='*60}")
+    print(f"  AI CTO System — RESUME: {resume_project_id}")
+    print(f"  Loading: {board_path}")
+    print(f"{'='*60}\n")
+
+    try:
+        state = resume_state_from_board(board_path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+
+    completed_before = len(state.get("completed_task_ids", []))
+    total = len(state.get("tasks", []))
+    print(f"  Resuming from task {state['active_task_id']} "
+          f"({completed_before}/{total} tasks already done)\n")
+
+    graph = build_resume_graph()
+
+    for event in graph.stream(state):
+        node_name = list(event.keys())[0]
+        node_state = event[node_name]
+        status = node_state.get("status", "?")
+        active = node_state.get("active_task_id")
+        print(f"[{node_name.upper()}] status={status}  active_task={active}")
+
+    final = node_state
+    print(f"\n{'='*60}")
+    if final.get("status") == "done":
+        print("SUCCESS")
+        print(final.get("final_output", ""))
+    else:
+        print("FAILED / BLOCKED")
         print(final.get("final_output", "No output available."))
     print(f"{'='*60}\n")
 

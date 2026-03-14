@@ -22,7 +22,7 @@ Mock code properties:
 
 import os
 import logging
-from ai_cto.state import ProjectState, TaskItem
+from ai_cto.state import ProjectState, TaskItem, make_task_item, next_unblocked_task
 from ai_cto.tools.file_writer import write_files
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,7 @@ MOCK_ARCHITECTURE = """\
 """
 
 MOCK_TASKS: list[TaskItem] = [
-    TaskItem(
+    make_task_item(
         id=1,
         title="Implement Todo CRUD operations",
         description=(
@@ -84,8 +84,59 @@ MOCK_TASKS: list[TaskItem] = [
             "get_todo, update_todo, delete_todo) backed by an in-memory list. "
             "Add a __main__ block that exercises every operation and exits 0."
         ),
-        status="pending",
+        priority=1,
+        depends_on=[],
+        outputs=["main.py", "requirements.txt"],
     )
+]
+
+# Extended 4-task mock for multi-task demonstrations and verification.
+# Activated by setting AI_CTO_MOCK_EXTENDED=true.
+# All 4 tasks use the same known-good MOCK_MAIN_PY so coding/execution
+# succeed on every pass — the point is to exercise the orchestration layer.
+MOCK_TASKS_EXTENDED: list[TaskItem] = [
+    make_task_item(
+        id=1,
+        title="Scaffold project structure",
+        description=(
+            "Create requirements.txt and the entry-point stub main.py "
+            "with module docstring and import block."
+        ),
+        priority=1,
+        depends_on=[],
+        outputs=["main.py", "requirements.txt"],
+    ),
+    make_task_item(
+        id=2,
+        title="Implement in-memory data store",
+        description=(
+            "Add _todos list and _next_id counter with create_todo / get_all_todos."
+        ),
+        priority=2,
+        depends_on=[1],
+        outputs=["main.py"],
+    ),
+    make_task_item(
+        id=3,
+        title="Implement CRUD operations",
+        description=(
+            "Add get_todo, update_todo, delete_todo with full input validation."
+        ),
+        priority=3,
+        depends_on=[2],
+        outputs=["main.py"],
+    ),
+    make_task_item(
+        id=4,
+        title="Add main entry point and integration test",
+        description=(
+            "Add __main__ block that exercises all five CRUD functions "
+            "and exits 0 on success."
+        ),
+        priority=4,
+        depends_on=[3],
+        outputs=["main.py"],
+    ),
 ]
 
 
@@ -314,28 +365,60 @@ MOCK_GENERATED_TESTS: dict[str, str] = {
 # ── Node-level mock functions (called by each agent) ──────────────────────────
 
 def mock_planning_node(state: ProjectState) -> ProjectState:
-    """Return a pre-defined architecture plan and task list."""
+    """Return a pre-defined architecture document (tasks handled by TaskManagerAgent)."""
     log_mock_banner("PlanningAgent")
-    logger.info("[MOCK] Architecture plan ready. %d task(s).", len(MOCK_TASKS))
+    logger.info("[MOCK] Architecture plan ready.")
     return {
         **state,
         "architecture": MOCK_ARCHITECTURE,
-        "tasks": list(MOCK_TASKS),
-        "current_task_index": 0,
+        "status": "task_managing",
+    }
+
+
+def mock_task_manager_node(state: ProjectState) -> ProjectState:
+    """Return the pre-defined task list, set the first active task, and persist board.
+
+    Set AI_CTO_MOCK_EXTENDED=true to use the 4-task extended task list.
+    """
+    from ai_cto.state import task_history_event
+    from ai_cto.tools.task_board import persist_task_board
+    log_mock_banner("TaskManagerAgent")
+    if os.environ.get("AI_CTO_MOCK_EXTENDED", "").lower() in ("1", "true", "yes"):
+        tasks = list(MOCK_TASKS_EXTENDED)
+        logger.info("[MOCK] Using EXTENDED 4-task list.")
+    else:
+        tasks = list(MOCK_TASKS)
+    first_task = next_unblocked_task(tasks)
+    active_id = first_task["id"] if first_task else None
+    first_idx = next(
+        (i for i, t in enumerate(tasks) if t["id"] == active_id), 0
+    ) if active_id is not None else 0
+    history = list(state.get("task_history", []))
+    if active_id is not None:
+        history.append(task_history_event(active_id, "started"))
+    logger.info("[MOCK] %d task(s) created. First active task id=%s.", len(tasks), active_id)
+    new_state = {
+        **state,
+        "tasks": tasks,
+        "active_task_id": active_id,
+        "current_task_index": first_idx,
+        "task_history": history,
         "status": "coding",
     }
+    persist_task_board(new_state)
+    return new_state
 
 
 def mock_coding_node(state: ProjectState) -> ProjectState:
     """Return the pre-defined todo app source files and write them to disk."""
-    task = state["tasks"][state["current_task_index"]]
+    from ai_cto.state import get_active_task, update_task_in_list
+    task = get_active_task(state) or state["tasks"][state["current_task_index"]]
     log_mock_banner("CodingAgent")
     logger.info("[MOCK] Returning mock files for task: %s", task["title"])
 
     write_files(project_id=state["project_id"], files=MOCK_GENERATED_FILES)
 
-    updated_tasks = list(state["tasks"])
-    updated_tasks[state["current_task_index"]] = {**task, "status": "in_progress"}
+    updated_tasks = update_task_in_list(state["tasks"], task["id"], status="in_progress")
 
     return {
         **state,

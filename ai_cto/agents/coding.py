@@ -15,7 +15,7 @@ import json
 import re
 import logging
 from anthropic import Anthropic
-from ai_cto.state import ProjectState
+from ai_cto.state import ProjectState, get_active_task, update_task_in_list
 from ai_cto.tools.file_writer import write_files
 from ai_cto.mock_llm import is_mock_mode, mock_coding_node
 
@@ -53,7 +53,7 @@ def coding_node(state: ProjectState) -> ProjectState:
     Transforms state:
         state.tasks[current_task_index]  →  state.generated_files + disk files
     """
-    task = state["tasks"][state["current_task_index"]]
+    task = get_active_task(state) or state["tasks"][state["current_task_index"]]
     logger.info("[CodingAgent] Implementing task %d: %s", task["id"], task["title"])
 
     if is_mock_mode():
@@ -105,12 +105,8 @@ def coding_node(state: ProjectState) -> ProjectState:
         entry_point,
     )
 
-    # Mark task as in_progress
-    updated_tasks = list(state["tasks"])
-    updated_tasks[state["current_task_index"]] = {
-        **task,
-        "status": "in_progress",
-    }
+    # Mark active task as in_progress
+    updated_tasks = update_task_in_list(state["tasks"], task["id"], status="in_progress")
 
     return {
         **state,

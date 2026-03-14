@@ -4,17 +4,17 @@ planning.py — Planning Agent
 Responsibilities:
   - Receive the raw user idea from ProjectState
   - Call Claude to produce a Markdown architecture document
-  - Parse a structured task list from the response
-  - Write both back into ProjectState
+  - Write the architecture back into ProjectState
 
 The Planning Agent runs exactly ONCE per project (at the start).
+Task decomposition is handled by the TaskManagerAgent which runs next.
 """
 
 import json
 import re
 import logging
 from anthropic import Anthropic
-from ai_cto.state import ProjectState, TaskItem
+from ai_cto.state import ProjectState
 from ai_cto.mock_llm import is_mock_mode, mock_planning_node
 
 logger = logging.getLogger(__name__)
@@ -22,23 +22,17 @@ logger = logging.getLogger(__name__)
 # ── Prompt ─────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a senior software architect and AI CTO.
-Given a software idea, you must:
-1. Write a concise architecture document (Markdown, max 400 words).
-2. Break the work into 3-6 discrete, sequential implementation tasks.
+Given a software idea, write a concise architecture document in Markdown (max 400 words).
 
 Return your response as valid JSON with this exact shape:
 {
-  "architecture": "<markdown string>",
-  "tasks": [
-    {"id": 1, "title": "...", "description": "..."},
-    ...
-  ]
+  "architecture": "<markdown string>"
 }
 
 Rules:
-- Tasks must be small enough that one can be implemented in a single file or module.
-- Do not include testing or deployment tasks in v1.
 - Architecture must cover: components, data flow, tech stack choices.
+- Be concrete and specific — avoid generic boilerplate.
+- Do not include a task list; that will be handled separately.
 """
 
 
@@ -49,7 +43,7 @@ def planning_node(state: ProjectState) -> ProjectState:
     LangGraph node: Planning Agent.
 
     Transforms state:
-        state.idea  →  state.architecture + state.tasks + state.status
+        state.idea  →  state.architecture + state.status
     """
     logger.info("[PlanningAgent] Starting architecture planning for: %s", state["idea"])
 
@@ -80,29 +74,17 @@ def planning_node(state: ProjectState) -> ProjectState:
     raw = response.content[0].text
     logger.debug("[PlanningAgent] Raw response:\n%s", raw)
 
-    # Parse JSON — strip markdown fences if present
     json_str = _extract_json(raw)
     parsed = json.loads(json_str)
 
     architecture: str = parsed["architecture"]
-    tasks: list[TaskItem] = [
-        TaskItem(
-            id=t["id"],
-            title=t["title"],
-            description=t["description"],
-            status="pending",
-        )
-        for t in parsed["tasks"]
-    ]
 
-    logger.info("[PlanningAgent] Produced %d tasks.", len(tasks))
+    logger.info("[PlanningAgent] Architecture ready (%d chars).", len(architecture))
 
     return {
         **state,
         "architecture": architecture,
-        "tasks": tasks,
-        "current_task_index": 0,
-        "status": "coding",
+        "status": "task_managing",
     }
 
 
@@ -110,11 +92,9 @@ def planning_node(state: ProjectState) -> ProjectState:
 
 def _extract_json(text: str) -> str:
     """Strip markdown code fences and return the raw JSON string."""
-    # Match ```json ... ``` or ``` ... ```
     match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", text)
     if match:
         return match.group(1)
-    # Fallback: find first { ... } block
     start = text.find("{")
     end = text.rfind("}") + 1
     if start != -1 and end > start:

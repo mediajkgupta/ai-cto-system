@@ -1,23 +1,33 @@
 """
-debug.py — Debug Agent
+debug.py — Debug Agent (V2)
 
 Responsibilities:
-  - Receive the error context (stderr + exit code) from ProjectState
+  - Receive error context (stderr + exit code or verification errors) from state
   - Receive the failing generated_files
   - Call Claude to diagnose the error and produce a patched file set
-  - Increment debug_attempts counter
-  - If max_debug_attempts exceeded, mark status as 'failed'
-  - Otherwise, route back to the Coding Agent for re-execution
+  - Track retries PER TASK (TaskItem.retries) rather than per project
+  - If task.max_retries exceeded: mark that task failed, persist task board,
+    and halt the project with status="failed"
+  - Otherwise: write the patch, update task.retries, persist board, route back
+    to CodingAgent for re-execution
 
-The Debug Agent does NOT rewrite from scratch — it patches specific files.
+V2 changes from V1:
+  - Per-task retry counter (TaskItem.retries) is the primary gate
+  - state.debug_attempts still incremented for backward compat with MemoryAgent
+  - Exhausted path calls mark_task_failed + persist_task_board
+  - Successful patch path calls persist_task_board
 """
 
 import json
 import re
 import logging
 from anthropic import Anthropic
-from ai_cto.state import ProjectState
+from ai_cto.state import (
+    ProjectState, get_active_task, update_task_in_list, now_iso,
+    task_history_event,
+)
 from ai_cto.tools.file_writer import write_files
+from ai_cto.tools.task_board import mark_task_failed, persist_task_board
 from ai_cto.mock_llm import is_mock_mode, mock_debug_node
 
 logger = logging.getLogger(__name__)
@@ -57,39 +67,102 @@ def debug_node(state: ProjectState) -> ProjectState:
     LangGraph node: Debug Agent.
 
     Transforms state:
-        state.error_context + state.generated_files  →  patched state.generated_files
+        state.error_context + state.generated_files  →  patched generated_files
+
+    V2 retry contract:
+        - reads  task.retries      (per-task; incremented here)
+        - reads  task.max_retries  (per-task cap; defaults to state.max_debug_attempts)
+        - writes task.retries, task.updated_at  on each attempt
+        - on exhaustion: marks task failed, persists board, returns status="failed"
+        - also increments state.debug_attempts for MemoryAgent backward compat
     """
-    attempts = state["debug_attempts"] + 1
-    max_attempts = state["max_debug_attempts"]
+    active = get_active_task(state)
+
+    # ── Compute retry counters ─────────────────────────────────────────────────
+    if active is not None:
+        task_retries = active.get("retries", 0) + 1
+        task_max_retries = active.get("max_retries", state["max_debug_attempts"])
+    else:
+        # Fallback: no active task tracked — use project-level counter
+        task_retries = state["debug_attempts"] + 1
+        task_max_retries = state["max_debug_attempts"]
 
     logger.info(
-        "[DebugAgent] Debug attempt %d/%d for project '%s'",
-        attempts,
-        max_attempts,
+        "[DebugAgent] Debug attempt %d/%d for task id=%s in project '%s'",
+        task_retries,
+        task_max_retries,
+        active["id"] if active else "?",
         state["project_id"],
     )
 
-    # Guard: always checked first, even in mock mode
-    if attempts > max_attempts:
-        logger.error("[DebugAgent] Max debug attempts reached. Marking as failed.")
-        return {
-            **state,
-            "debug_attempts": attempts,
-            "status": "failed",
-            "final_output": (
-                f"Project failed after {max_attempts} debug attempts.\n"
-                f"Last error:\n{state['error_context']}"
-            ),
-        }
+    # ── Guard: exhaustion check (runs before mock mode) ────────────────────────
+    if task_retries > task_max_retries:
+        logger.error(
+            "[DebugAgent] Task id=%s exceeded max retries (%d). Marking failed.",
+            active["id"] if active else "?",
+            task_max_retries,
+        )
+        error_msg = state.get("error_context", "")
 
+        if active is not None:
+            failed_updates = mark_task_failed(state, active["id"], error_msg)
+            # Add a "failed" history entry
+            history = failed_updates.get("task_history", state.get("task_history", []))
+            failed_state = {
+                **state,
+                **failed_updates,
+                "task_history": history,
+                "debug_attempts": task_retries,
+                "project_status": "failed",
+                "status": "failed",
+                "final_output": (
+                    f"Project failed: task '{active['title']}' exhausted "
+                    f"{task_max_retries} debug attempt(s).\n"
+                    f"Last error:\n{error_msg}"
+                ),
+            }
+        else:
+            failed_state = {
+                **state,
+                "debug_attempts": task_retries,
+                "project_status": "failed",
+                "status": "failed",
+                "final_output": (
+                    f"Project failed after {task_max_retries} debug attempt(s).\n"
+                    f"Last error:\n{error_msg}"
+                ),
+            }
+
+        persist_task_board(failed_state)
+        return failed_state
+
+    # ── Mock mode ──────────────────────────────────────────────────────────────
     if is_mock_mode():
-        return mock_debug_node(state, attempts)
+        result = mock_debug_node(state, task_retries)
+        # Update per-task retries in the result so it's reflected in task_board.json
+        if active is not None:
+            updated_tasks = update_task_in_list(
+                result["tasks"], active["id"],
+                retries=task_retries,
+                updated_at=now_iso(),
+            )
+            history = list(result.get("task_history", [])) + [
+                task_history_event(active["id"], "retry",
+                                   detail=f"attempt {task_retries}")
+            ]
+            result = {
+                **result,
+                "tasks": updated_tasks,
+                "task_history": history,
+                "debug_attempts": task_retries,
+            }
+            persist_task_board(result)
+        return result
 
+    # ── Real LLM call ──────────────────────────────────────────────────────────
     client = Anthropic()
 
-    # Retrieve past debug solutions for similar errors (injected by MemoryAgent)
     memory_context = state.get("memory_context", "")
-
     user_message = ""
     if memory_context:
         user_message += f"Past debug solutions for reference:\n{memory_context}\n\n---\n\n"
@@ -122,21 +195,42 @@ def debug_node(state: ProjectState) -> ProjectState:
         len(patched_files),
     )
 
-    # Merge patches into the existing file set
+    # Merge patches + write to disk
     merged_files = {**state["generated_files"], **patched_files}
-
-    # Write patched files to disk
     write_files(project_id=state["project_id"], files=patched_files)
 
-    return {
+    # Update per-task retries on the task object
+    tasks = state["tasks"]
+    if active is not None:
+        tasks = update_task_in_list(
+            tasks, active["id"],
+            retries=task_retries,
+            updated_at=now_iso(),
+        )
+
+    # Record retry event in history
+    history = list(state.get("task_history", [])) + [
+        task_history_event(
+            active["id"] if active else -1,
+            "retry",
+            detail=f"attempt {task_retries}: {diagnosis[:100]}",
+        )
+    ]
+
+    new_state = {
         **state,
         "generated_files": merged_files,
-        "debug_attempts": attempts,
-        "last_debug_diagnosis": diagnosis,           # saved to memory on completion
+        "tasks": tasks,
+        "task_history": history,
+        "debug_attempts": task_retries,          # backward compat for MemoryAgent
+        "last_debug_diagnosis": diagnosis,        # saved to memory on completion
         "_last_error_context": state["error_context"],  # the error that was fixed
         "error_context": "",      # cleared — will be repopulated by ExecutionAgent
         "status": "coding",       # route back to CodingAgent for re-execution
     }
+
+    persist_task_board(new_state)
+    return new_state
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
