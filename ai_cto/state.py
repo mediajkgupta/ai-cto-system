@@ -133,6 +133,15 @@ class ProjectState(TypedDict):
     Per-task retry tracking uses TaskItem.retries instead.
     """
 
+    execution_timeout_count: int
+    """
+    Consecutive timeout count for the currently active task.
+    Incremented each time the sandbox exits with a timeout signal.
+    Resets to 0 when advancing to a new task.
+    When this reaches 2 the execution node returns status='failed' directly
+    (timeouts are not a code bug, so routing through the debug loop wastes retries).
+    """
+
     max_debug_attempts: int
     """
     Fallback retry cap used when the active task has no max_retries field.
@@ -207,6 +216,7 @@ def initial_state(idea: str, project_id: str) -> ProjectState:
         error_context="",
         debug_attempts=0,
         max_debug_attempts=3,
+        execution_timeout_count=0,
         status="planning",
         final_output="",
         memory_context="",

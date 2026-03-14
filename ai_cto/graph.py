@@ -74,8 +74,13 @@ def route_after_execution(state: ProjectState) -> str:
     Returns:
         "debug"        → execution failed, attempts remaining
         "advance_task" → execution succeeded
+        "end"          → consecutive timeout limit reached; task marked failed
     """
-    if state["status"] == "debugging":
+    status = state["status"]
+    if status == "failed":
+        logger.error("[Controller] Execution hit consecutive timeout limit → ending.")
+        return "end"
+    if status == "debugging":
         logger.info("[Controller] Execution failed → routing to DebugAgent.")
         return "debug"
     logger.info("[Controller] Execution succeeded → advancing task.")
@@ -200,7 +205,8 @@ def advance_task_node(state: ProjectState) -> ProjectState:
         "active_task_id": next_task["id"],
         "current_task_index": next_idx,
         "task_history": history,
-        "debug_attempts": 0,    # reset project-level counter for MemoryAgent
+        "debug_attempts": 0,             # reset project-level counter for MemoryAgent
+        "execution_timeout_count": 0,    # reset per-task timeout counter
         "error_context": "",
         "status": "coding",
     }
@@ -241,7 +247,7 @@ def build_resume_graph() -> StateGraph:
     graph.add_conditional_edges(
         "execution",
         route_after_execution,
-        {"debug": "debug", "advance_task": "advance_task"},
+        {"debug": "debug", "advance_task": "advance_task", "end": END},
     )
     graph.add_conditional_edges(
         "debug",
@@ -295,7 +301,7 @@ def build_graph() -> StateGraph:
     graph.add_conditional_edges(
         "execution",
         route_after_execution,
-        {"debug": "debug", "advance_task": "advance_task"},
+        {"debug": "debug", "advance_task": "advance_task", "end": END},
     )
 
     # Conditional: after debug

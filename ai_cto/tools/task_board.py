@@ -142,6 +142,7 @@ def persist_task_board(state: dict) -> "Path":
     board = {
         "project_id": state.get("project_id", ""),
         "project_goal": state.get("idea", ""),
+        "architecture": state.get("architecture", ""),
         "project_status": state.get("project_status", "active"),
         "active_task_id": state.get("active_task_id"),
         "tasks": state.get("tasks", []),
@@ -282,6 +283,7 @@ def resume_state_from_board(board_path: "Path") -> "ProjectState":
     )
     return {
         **base,
+        "architecture": board.get("architecture", ""),
         "tasks": tasks,
         "active_task_id": next_task["id"],
         "current_task_index": next_idx,

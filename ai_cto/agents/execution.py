@@ -11,6 +11,12 @@ Safety design:
   - Docker mode: --network none, read-only filesystem, memory capped
   - Subprocess fallback: used only in local dev when Docker is unavailable
   - Hard timeout of 30 seconds prevents runaway processes
+
+Timeout handling:
+  - A single timeout prefixes the error_context with [TIMEOUT] and routes
+    to the debug loop (may be a slow start, not a hard bug).
+  - Two consecutive timeouts on the same task skip the debug loop and mark
+    the task failed immediately (the code is stuck, not incorrect).
 """
 
 import logging
@@ -20,7 +26,10 @@ from ai_cto.tools.sandbox import run_in_docker, run_in_subprocess, docker_availa
 
 logger = logging.getLogger(__name__)
 
-EXECUTION_TIMEOUT = 30  # seconds
+EXECUTION_TIMEOUT = 30        # seconds
+MAX_CONSECUTIVE_TIMEOUTS = 2  # fail the task after this many consecutive timeouts
+
+_TIMEOUT_MARKER = "Execution timed out"
 
 
 # ── Agent node ─────────────────────────────────────────────────────────────────
@@ -68,19 +77,67 @@ def execution_node(state: ProjectState) -> ProjectState:
         len(result["stderr"]),
     )
 
-    # Determine next status
+    # ── Success ───────────────────────────────────────────────────────────────
     if result["exit_code"] == 0:
-        next_status = "done"
-        error_context = ""
-    else:
-        next_status = "debugging"
-        error_context = _build_error_context(result)
+        return {
+            **state,
+            "execution_result": result,
+            "error_context": "",
+            "execution_timeout_count": 0,
+            "status": "done",
+        }
 
+    # ── Failure: check for timeout ────────────────────────────────────────────
+    is_timeout = _TIMEOUT_MARKER in result.get("stderr", "")
+    timeout_count = state.get("execution_timeout_count", 0)
+
+    if is_timeout:
+        timeout_count += 1
+        logger.warning(
+            "[ExecutionAgent] Execution timed out (consecutive count=%d/%d).",
+            timeout_count,
+            MAX_CONSECUTIVE_TIMEOUTS,
+        )
+
+        if timeout_count >= MAX_CONSECUTIVE_TIMEOUTS:
+            error_context = (
+                f"[TIMEOUT] Task timed out {timeout_count} time(s) consecutively "
+                f"(>{EXECUTION_TIMEOUT}s). The code appears stuck; marking task failed.\n\n"
+                + _build_error_context(result)
+            )
+            logger.error(
+                "[ExecutionAgent] Consecutive timeout limit reached — failing task."
+            )
+            return {
+                **state,
+                "execution_result": result,
+                "error_context": error_context,
+                "execution_timeout_count": timeout_count,
+                "status": "failed",
+            }
+
+        # Single timeout — route through debug loop with advisory prefix
+        error_context = (
+            f"[TIMEOUT] Execution exceeded {EXECUTION_TIMEOUT}s. "
+            f"This may be an infinite loop or a blocking call. "
+            f"Check for missing exit conditions or blocking I/O.\n\n"
+            + _build_error_context(result)
+        )
+        return {
+            **state,
+            "execution_result": result,
+            "error_context": error_context,
+            "execution_timeout_count": timeout_count,
+            "status": "debugging",
+        }
+
+    # ── Non-timeout failure ───────────────────────────────────────────────────
     return {
         **state,
         "execution_result": result,
-        "error_context": error_context,
-        "status": next_status,
+        "error_context": _build_error_context(result),
+        "execution_timeout_count": 0,   # reset; this was a code bug, not a timeout
+        "status": "debugging",
     }
 
 

@@ -21,6 +21,8 @@ from ai_cto.mock_llm import is_mock_mode, mock_coding_node
 
 logger = logging.getLogger(__name__)
 
+MAX_PARSE_RETRIES = 2  # extra attempts after the first on JSON parse failure
+
 # ── Prompt ─────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a senior software engineer.
@@ -52,6 +54,10 @@ def coding_node(state: ProjectState) -> ProjectState:
 
     Transforms state:
         state.tasks[current_task_index]  →  state.generated_files + disk files
+
+    Retries the LLM call up to MAX_PARSE_RETRIES times on JSON parse failure.
+    On exhaustion returns status='verifying_failed' so the debug loop can
+    record the failure and advance to the next retry.
     """
     task = get_active_task(state) or state["tasks"][state["current_task_index"]]
     logger.info("[CodingAgent] Implementing task %d: %s", task["id"], task["title"])
@@ -60,35 +66,48 @@ def coding_node(state: ProjectState) -> ProjectState:
         return mock_coding_node(state)
 
     client = Anthropic()
+    user_message = _build_user_message(state, task)
 
-    user_message = (
-        f"Architecture:\n{state['architecture']}\n\n"
-        f"Task to implement:\n"
-        f"Title: {task['title']}\n"
-        f"Description: {task['description']}\n"
-    )
+    parsed = None
+    last_error = None
+    for attempt in range(1, MAX_PARSE_RETRIES + 2):  # 1 .. MAX_PARSE_RETRIES+1
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            raw = response.content[0].text
+            logger.debug("[CodingAgent] Raw response (attempt %d):\n%s", attempt, raw)
 
-    # If we're retrying after a debug patch, include the previous error
-    if state.get("error_context"):
-        user_message += (
-            f"\nPrevious attempt failed with this error — fix it:\n"
-            f"{state['error_context']}\n\n"
-            f"Previously generated files for reference:\n"
-            f"{json.dumps(state['generated_files'], indent=2)}"
+            json_str = _extract_json(raw)
+            parsed = json.loads(json_str)
+            if "files" not in parsed or not isinstance(parsed["files"], dict):
+                raise ValueError("Response JSON missing 'files' dict.")
+            break
+
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            last_error = exc
+            logger.warning(
+                "[CodingAgent] Attempt %d/%d failed to parse (%s). %s.",
+                attempt,
+                MAX_PARSE_RETRIES + 1,
+                exc,
+                "Retrying" if attempt <= MAX_PARSE_RETRIES else "Giving up",
+            )
+
+    if parsed is None:
+        error_msg = (
+            f"CodingAgent failed to produce valid JSON after "
+            f"{MAX_PARSE_RETRIES + 1} attempt(s). Last error: {last_error}"
         )
-
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}]
-    )
-
-    raw = response.content[0].text
-    logger.debug("[CodingAgent] Raw response:\n%s", raw)
-
-    json_str = _extract_json(raw)
-    parsed = json.loads(json_str)
+        logger.error("[CodingAgent] %s", error_msg)
+        return {
+            **state,
+            "error_context": error_msg,
+            "status": "verifying_failed",
+        }
 
     generated_files: dict[str, str] = parsed["files"]
     entry_point: str = parsed.get("entry_point", "main.py")
@@ -119,6 +138,48 @@ def coding_node(state: ProjectState) -> ProjectState:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _build_user_message(state: ProjectState, task: dict) -> str:
+    """
+    Build the user-turn message for the LLM.
+
+    Three cases:
+      1. Fresh start: architecture + task.
+      2. Retry after execution failure (error_context set): include previous
+         error and previously generated files for reference.
+      3. Retry after a successful debug patch (debug_attempts > 0, no
+         error_context): inject patched file contents so the LLM preserves
+         all prior fixes and only makes targeted changes.
+    """
+    msg = (
+        f"Architecture:\n{state['architecture']}\n\n"
+        f"Task to implement:\n"
+        f"Title: {task['title']}\n"
+        f"Description: {task['description']}\n"
+    )
+
+    if state.get("error_context"):
+        # Case 2: retrying after a known failure
+        msg += (
+            f"\nPrevious attempt failed with this error — fix it:\n"
+            f"{state['error_context']}\n\n"
+            f"Previously generated files for reference:\n"
+            f"{json.dumps(state['generated_files'], indent=2)}"
+        )
+    elif state.get("debug_attempts", 0) > 0 and state.get("generated_files"):
+        # Case 3: debug agent produced a patch; preserve its fixes
+        patched_contents = "\n".join(
+            f"### {path}\n```python\n{content}\n```"
+            for path, content in state["generated_files"].items()
+        )
+        msg += (
+            f"\nPreviously patched files (preserve these fixes, "
+            f"only modify what is strictly necessary):\n"
+            f"{patched_contents}"
+        )
+
+    return msg
+
 
 def _extract_json(text: str) -> str:
     """Strip markdown code fences and return the raw JSON string."""
