@@ -160,6 +160,7 @@ def advance_task_node(state: ProjectState) -> ProjectState:
         result = {
             **state,
             "project_status": "complete",
+            "active_task_id": None,   # no active task in terminal state
             "status": "saving_memory",
             "final_output": summary,
         }

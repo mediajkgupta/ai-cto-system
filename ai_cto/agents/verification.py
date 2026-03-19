@@ -21,7 +21,9 @@ Routing contract:
 
 import logging
 from ai_cto.state import ProjectState
-from ai_cto.verification.checks import run_all_checks, VerificationResult
+from ai_cto.verification.checks import (
+    run_all_checks, VerificationResult, detect_stack, detect_node_entry,
+)
 from ai_cto.verification.test_generator import generate_tests
 from ai_cto.tools.file_writer import write_files
 
@@ -38,10 +40,36 @@ def verification_node(state: ProjectState) -> ProjectState:
     entry_point = state.get("_entry_point", "main.py")
     files = state["generated_files"]
 
+    # ── Auto-detect stack and correct entry point ──────────────────────────────
+    # Prevents 'main.py' being used as a universal success path for non-Python
+    # projects.  When Node.js files are detected, override entry_point to the
+    # real JS entry file — or keep the explicit value if it names a non-empty JS
+    # file itself.
+    stack = detect_stack(files)
+    if stack == "node":
+        current_is_empty = not files.get(entry_point, "").strip()
+        current_is_python_default = entry_point == "main.py"
+        if current_is_empty or current_is_python_default:
+            js_entry = detect_node_entry(files)
+            if js_entry:
+                logger.info(
+                    "[VerificationAgent] Node.js stack detected — overriding entry "
+                    "point '%s' → '%s'.",
+                    entry_point, js_entry,
+                )
+                entry_point = js_entry
+            else:
+                logger.warning(
+                    "[VerificationAgent] Node.js stack detected but no non-empty "
+                    "JS entry file found — proceeding with '%s'.",
+                    entry_point,
+                )
+
     logger.info(
-        "[VerificationAgent] Checking %d file(s), entry point: %s",
+        "[VerificationAgent] Checking %d file(s), entry point: %s (stack: %s)",
         len(files),
         entry_point,
+        stack,
     )
 
     # ── Step 1: static checks (no LLM) ────────────────────────────────────────
@@ -90,10 +118,18 @@ def verification_node(state: ProjectState) -> ProjectState:
 def _try_generate_tests(state: ProjectState) -> dict[str, str]:
     """
     Attempt test generation. Returns {} on any failure — never blocks the pipeline.
+
+    Uses _current_task_files when available (set by CodingAgent to just the files
+    written in this coding pass) so the TestGenerator writes tests scoped to what
+    the current task actually produces — not the full accumulated project state.
+    This prevents scaffold tasks from triggering complete CRUD test suites before
+    the implementation exists.
     """
+    # Prefer current-task scope; fall back to full accumulated files if not set
+    task_files = state.get("_current_task_files") or state["generated_files"]
     try:
         return generate_tests(
-            files=state["generated_files"],
+            files=task_files,
             architecture=state.get("architecture", ""),
             project_id=state["project_id"],
         )

@@ -23,13 +23,39 @@ Mock mode: returns MOCK_TASKS / MOCK_TASKS_EXTENDED without any API call.
 import json
 import re
 import logging
-from anthropic import Anthropic
+from ai_cto.providers import get_provider
 from ai_cto.state import (
     ProjectState, make_task_item, get_next_runnable_task,
     task_history_event,
 )
 from ai_cto.tools.task_board import persist_task_board
 from ai_cto.mock_llm import is_mock_mode, mock_task_manager_node
+
+# ── Post-processing filter: keyword sets ────────────────────────────────────
+
+_SETUP_WORDS = frozenset({
+    "setup", "set", "install", "installation", "environment", "env",
+    "initialize", "init", "bootstrap", "scaffold", "configure",
+    "configuration", "prerequisite", "dependencies", "venv", "virtualenv",
+})
+_TEST_WORDS = frozenset({
+    "test", "tests", "testing", "spec", "specs", "jest", "pytest",
+    "unittest", "mocha", "coverage",
+})
+_DEPLOY_WORDS = frozenset({
+    "deploy", "deployment", "docker", "dockerize", "dockerfile",
+    "containerize", "container", "kubernetes", "k8s", "pipeline",
+    "devops", "ansible", "terraform", "nginx", "release", "makefile",
+})
+
+_TEST_OUTPUT_PATTERNS = (
+    ".test.js", ".spec.js", ".test.ts", ".spec.ts",
+    ".test.py", "_test.py", "test_", "/test/", "/tests/",
+)
+_DEPLOY_OUTPUT_PATTERNS = (
+    "dockerfile", "docker-compose", ".github/",
+    "jenkinsfile", "makefile", ".sh",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,17 +81,28 @@ Return ONLY valid JSON — no markdown fences, no extra text:
   ]
 }
 
-Rules:
-- Produce 2-6 tasks. Each task must be completable in a single coding session.
-- id: sequential integers. If the prompt lists already-completed task IDs, start
-  your IDs from max(completed_ids) + 1 to avoid conflicts.
-- priority: integer 1-5 where 1 = highest priority (runs first).
-- depends_on: list of task IDs that MUST finish before this one starts.
-  May reference completed task IDs (they are already done).
-- outputs: relative file paths this task will produce.
-- Cover the full implementation — no gaps, no overlap with completed work.
-- Do NOT include testing, deployment, or documentation-only tasks.
-- Do NOT include tasks that are already listed as completed.
+HARD RULES — violating any of these makes the output invalid:
+
+WHAT TO INCLUDE:
+- 2-5 tasks only. Each task writes source code files.
+- Every task MUST list at least one concrete output file (e.g. "app.py", "models.py").
+- Each task must be implementable by writing or editing source files alone.
+- Cover the full implementation with no gaps.
+
+WHAT TO EXCLUDE — do NOT include any task that:
+- Sets up a development environment, installs tools, or configures infrastructure.
+- Writes tests, test suites, or test fixtures (no pytest, unittest, jest, etc.).
+- Creates Dockerfiles, docker-compose files, CI/CD pipelines, or deployment configs.
+- Writes documentation, README files, or comments only.
+- Is vague — if you cannot name a concrete output file for the task, omit it.
+- Duplicates work already covered by another task in the list.
+
+FIELD RULES:
+- id: sequential integers starting at 1 (or max(completed_ids)+1 if resuming).
+- priority: integer 1-5, where 1 = highest priority (runs first).
+- depends_on: list of task IDs that must complete before this one starts.
+- outputs: list of relative file paths this task produces. Must be non-empty.
+- Do NOT include tasks already listed as completed.
 """
 
 
@@ -93,20 +130,18 @@ def task_manager_node(state: ProjectState) -> ProjectState:
     if is_mock_mode():
         return mock_task_manager_node(state)
 
-    client = Anthropic()
+    provider = get_provider()
     user_message = _build_user_message(state)
 
     llm_tasks = None
     last_error = None
     for attempt in range(1, MAX_PLAN_RETRIES + 2):  # 1 .. MAX_PLAN_RETRIES+1
         try:
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2048,
+            raw = provider.complete(
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
+                user=user_message,
+                max_tokens=2048,
             )
-            raw = response.content[0].text
             logger.debug("[TaskManagerAgent] Raw response (attempt %d):\n%s", attempt, raw)
 
             json_str = _extract_json(raw)
@@ -144,6 +179,22 @@ def task_manager_node(state: ProjectState) -> ProjectState:
         protected_ids=protected_ids,
     )
 
+    # ── Filter: deterministically remove non-coding tasks ──────────────────────
+    raw_count = len(tasks)
+    tasks, removed_entries = _filter_tasks(tasks, protected_ids)
+    removed_ids = {e["task"]["id"] for e in removed_entries}
+    if removed_entries:
+        logger.info(
+            "[TaskManagerAgent] Filter removed %d task(s) (kept %d/%d):",
+            len(removed_entries), len(tasks), raw_count,
+        )
+        for entry in removed_entries:
+            logger.info(
+                "  REMOVED task id=%d '%s' — %s",
+                entry["task"]["id"], entry["task"].get("title", "?"), entry["reason"],
+            )
+    tasks = _repair_dependencies(tasks, removed_ids)
+
     # ── Validate (warns; does not raise) ───────────────────────────────────────
     _validate_tasks(tasks, protected_ids)
 
@@ -161,11 +212,12 @@ def task_manager_node(state: ProjectState) -> ProjectState:
         history.append(task_history_event(active_id, "started"))
 
     logger.info(
-        "[TaskManagerAgent] %d total task(s) (%d protected + %d from LLM). "
-        "First active task id=%s.",
+        "[TaskManagerAgent] %d total task(s) (%d protected + %d from LLM, "
+        "%d filtered out). First active task id=%s.",
         len(tasks),
         len(protected_ids),
         len(tasks) - len(protected_ids),
+        len(removed_entries),
         active_id,
     )
 
@@ -198,9 +250,12 @@ def _build_user_message(state: ProjectState) -> str:
     """
     lines = []
 
-    memory_context = state.get("memory_context", "")
-    if memory_context:
-        lines.append(f"Past relevant architectures:\n{memory_context}\n\n---\n")
+    # Note: memory_context (past architectures) is intentionally NOT injected here.
+    # It is already used by PlanningAgent to inform the architecture document.
+    # Including it again in the task manager prompt would double the input length
+    # (~+500 tokens) and push CPU prefill time past the socket timeout on local
+    # inference. Task decomposition quality does not depend on raw past architectures —
+    # it depends on the current architecture, which is always present.
 
     lines.append(f"Project idea: {state['idea']}")
     lines.append("")
@@ -343,6 +398,138 @@ def _validate_tasks(tasks: list, protected_ids: set) -> None:
                         tid,
                         field,
                     )
+
+
+def _classify_task(task: dict) -> str | None:
+    """
+    Return a rejection reason string if the task should be filtered out,
+    or None if the task is acceptable.
+
+    Rejection criteria (applied in order):
+    1. No output files listed.
+    2. Output files are test files (by path pattern).
+    3. All output files are deploy/config files (by path pattern).
+    4. Title contains setup/environment keywords.
+    5. Title contains testing keywords.
+    6. Title contains deployment/devops keywords.
+    """
+    title = task.get("title", "").lower()
+    outputs = [o.lower() for o in task.get("outputs", [])]
+    title_words = set(re.findall(r"\w+", title))
+
+    if not outputs:
+        return "no output files listed"
+
+    if any(any(p in o for p in _TEST_OUTPUT_PATTERNS) for o in outputs):
+        return f"outputs include test files: {task.get('outputs')}"
+
+    if outputs and all(any(p in o for p in _DEPLOY_OUTPUT_PATTERNS) for o in outputs):
+        return f"outputs are deploy/config files: {task.get('outputs')}"
+
+    matched_setup = title_words & _SETUP_WORDS
+    if matched_setup:
+        return f"setup/environment task (title matched: {sorted(matched_setup)})"
+
+    matched_test = title_words & _TEST_WORDS
+    if matched_test:
+        return f"testing task (title matched: {sorted(matched_test)})"
+
+    matched_deploy = title_words & _DEPLOY_WORDS
+    if matched_deploy:
+        return f"deployment/devops task (title matched: {sorted(matched_deploy)})"
+
+    return None
+
+
+def _remove_output_duplicates(tasks: list, protected_ids: set) -> tuple[list, list]:
+    """
+    Remove tasks whose output files are a subset of outputs already covered
+    by an earlier task in the list (deduplication by output overlap).
+    Protected tasks are never removed.
+
+    Returns (kept, removed_entries).
+    """
+    seen_outputs: set = set()
+    kept: list = []
+    removed: list = []
+
+    for task in tasks:
+        if task["id"] in protected_ids:
+            seen_outputs.update(o.lower() for o in task.get("outputs", []))
+            kept.append(task)
+            continue
+
+        task_outputs = {o.lower() for o in task.get("outputs", [])}
+        overlap = task_outputs & seen_outputs
+        if task_outputs and overlap == task_outputs:
+            removed.append({
+                "task": task,
+                "reason": f"duplicate outputs already covered: {sorted(overlap)}",
+            })
+        else:
+            seen_outputs.update(task_outputs)
+            kept.append(task)
+
+    return kept, removed
+
+
+def _filter_tasks(tasks: list, protected_ids: set) -> tuple[list, list]:
+    """
+    Remove non-coding tasks from the list.
+
+    Rules (deterministic — no LLM):
+    - Protected tasks (completed/failed/blocked) are always kept.
+    - Non-protected tasks are tested against _classify_task():
+        * setup/install/environment tasks → removed
+        * test/testing tasks → removed
+        * deploy/docker/devops tasks → removed
+        * tasks with no output files → removed
+    - Output deduplication: tasks whose outputs are already fully covered
+      by an earlier task are removed.
+
+    Returns (kept_tasks, removed_entries) where each removed entry is:
+        {"task": <task_dict>, "reason": <str>}
+    """
+    kept: list = []
+    removed: list = []
+
+    for task in tasks:
+        if task["id"] in protected_ids:
+            kept.append(task)
+            continue
+        reason = _classify_task(task)
+        if reason:
+            removed.append({"task": task, "reason": reason})
+        else:
+            kept.append(task)
+
+    # Second pass: dedup by output overlap
+    kept, dup_removed = _remove_output_duplicates(kept, protected_ids)
+    removed.extend(dup_removed)
+
+    return kept, removed
+
+
+def _repair_dependencies(tasks: list, removed_ids: set) -> list:
+    """
+    Remove references to deleted task IDs from every task's depends_on list.
+    Returns a new list; does not mutate input.
+    """
+    result = []
+    for task in tasks:
+        deps = task.get("depends_on", [])
+        cleaned = [d for d in deps if d not in removed_ids]
+        if cleaned != deps:
+            logger.warning(
+                "[TaskManagerAgent] Task id=%d: removed %d broken dep(s) %s "
+                "(those tasks were filtered out).",
+                task["id"],
+                len(deps) - len(cleaned),
+                sorted(set(deps) - set(cleaned)),
+            )
+            task = {**task, "depends_on": cleaned}
+        result.append(task)
+    return result
 
 
 def _extract_json(text: str) -> str:

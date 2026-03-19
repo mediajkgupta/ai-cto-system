@@ -144,13 +144,11 @@ class TestFix1ArchitecturePersistence:
 class TestFix2CodingAgentParseRetry:
     """Tests require the real coding_node (not mock mode)."""
 
-    def _make_mock_client(self, responses):
-        """responses: list of strings returned by successive .create() calls."""
-        mock_client = MagicMock()
-        mock_client.messages.create.side_effect = [
-            MagicMock(content=[MagicMock(text=r)]) for r in responses
-        ]
-        return mock_client
+    def _make_mock_provider(self, responses):
+        """responses: list of strings returned by successive .complete() calls."""
+        mock_provider = MagicMock()
+        mock_provider.complete.side_effect = list(responses)
+        return mock_provider
 
     def test_succeeds_on_first_attempt(self, tmp_path):
         import ai_cto.tools.file_writer as _fw
@@ -161,10 +159,10 @@ class TestFix2CodingAgentParseRetry:
             "files": {"main.py": "print('hello')"},
             "entry_point": "main.py",
         })
-        mock_client = self._make_mock_client([good_json])
+        mock_provider = self._make_mock_provider([good_json])
 
         state = _base_state()
-        with patch("ai_cto.agents.coding.Anthropic", return_value=mock_client):
+        with patch("ai_cto.agents.coding.get_provider", return_value=mock_provider):
             with patch("ai_cto.agents.coding.is_mock_mode", return_value=False):
                 result = coding_node(state)
 
@@ -181,24 +179,24 @@ class TestFix2CodingAgentParseRetry:
             "files": {"app.py": "x = 1"},
             "entry_point": "app.py",
         })
-        mock_client = self._make_mock_client([bad, good])
+        mock_provider = self._make_mock_provider([bad, good])
 
         state = _base_state()
-        with patch("ai_cto.agents.coding.Anthropic", return_value=mock_client):
+        with patch("ai_cto.agents.coding.get_provider", return_value=mock_provider):
             with patch("ai_cto.agents.coding.is_mock_mode", return_value=False):
                 result = coding_node(state)
 
         assert result["status"] == "executing"
-        assert mock_client.messages.create.call_count == 2
+        assert mock_provider.complete.call_count == 2
 
     def test_returns_verifying_failed_after_all_retries(self):
         from ai_cto.agents.coding import coding_node
 
         bad = "This is not JSON at all."
-        mock_client = self._make_mock_client([bad, bad, bad])
+        mock_provider = self._make_mock_provider([bad, bad, bad])
 
         state = _base_state()
-        with patch("ai_cto.agents.coding.Anthropic", return_value=mock_client):
+        with patch("ai_cto.agents.coding.get_provider", return_value=mock_provider):
             with patch("ai_cto.agents.coding.is_mock_mode", return_value=False):
                 result = coding_node(state)
 
@@ -215,10 +213,10 @@ class TestFix2CodingAgentParseRetry:
             "files": {"main.py": "print('ok')"},
             "entry_point": "main.py",
         }) + "\n```"
-        mock_client = self._make_mock_client([fenced])
+        mock_provider = self._make_mock_provider([fenced])
 
         state = _base_state()
-        with patch("ai_cto.agents.coding.Anthropic", return_value=mock_client):
+        with patch("ai_cto.agents.coding.get_provider", return_value=mock_provider):
             with patch("ai_cto.agents.coding.is_mock_mode", return_value=False):
                 result = coding_node(state)
 
@@ -233,10 +231,10 @@ class TestFix2CodingAgentParseRetry:
             "files": {"svc.py": "pass"},
             "entry_point": "svc.py",
         }) + "\nHope this helps!"
-        mock_client = self._make_mock_client([prose_wrapped])
+        mock_provider = self._make_mock_provider([prose_wrapped])
 
         state = _base_state()
-        with patch("ai_cto.agents.coding.Anthropic", return_value=mock_client):
+        with patch("ai_cto.agents.coding.get_provider", return_value=mock_provider):
             with patch("ai_cto.agents.coding.is_mock_mode", return_value=False):
                 result = coding_node(state)
 

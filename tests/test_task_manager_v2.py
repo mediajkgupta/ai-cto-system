@@ -52,6 +52,23 @@ def tmp_workspace(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture()
+def isolated_memory(tmp_path):
+    """
+    Replace the global _store singleton with a fresh temp-path ChromaDB store.
+    Tests that run build_graph() + graph.stream() must use this to avoid
+    touching the production .chroma_db/ and failing on inconsistent on-disk state.
+    """
+    import ai_cto.agents.memory as _mem_module
+    from ai_cto.memory.store import ChromaMemoryStore
+
+    temp_store = ChromaMemoryStore(db_path=tmp_path / "test_chroma")
+    original_store = _mem_module._store
+    _mem_module._store = temp_store
+    yield temp_store
+    _mem_module._store = original_store
+
+
 def _state(**overrides):
     s = initial_state("Build a CRM app", "crm-proj")
     s.update(overrides)
@@ -339,6 +356,10 @@ class TestTaskBoardPersistence:
 # ── Full pipeline in mock mode ────────────────────────────────────────────────
 
 class TestMockPipelineV2:
+    @pytest.fixture(autouse=True)
+    def _isolate_memory(self, isolated_memory):
+        """Apply memory isolation to every test in this class."""
+
     def _run(self, tmp_workspace, idea="Build a REST API", project_id="v2-test"):
         from ai_cto.state import initial_state
         from ai_cto.graph import build_graph

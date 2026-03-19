@@ -45,6 +45,29 @@ def tmp_workspace(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture
+def isolated_memory(tmp_path):
+    """
+    Replace the global _store singleton with a fresh ChromaMemoryStore backed
+    by a temp directory for the duration of one test.
+
+    Without this fixture, tests that run build_graph() + graph.stream() hit
+    memory_retrieve_node, which lazily initialises _store pointing at the
+    production .chroma_db/.  If .chroma_db/ is in any inconsistent state
+    (partial write, stale HNSW files, concurrent access) those tests will
+    fail non-deterministically.  This fixture makes each pipeline test fully
+    isolated and deterministic.
+    """
+    import ai_cto.agents.memory as _mem_module
+    from ai_cto.memory.store import ChromaMemoryStore
+
+    temp_store = ChromaMemoryStore(db_path=tmp_path / "test_chroma")
+    original_store = _mem_module._store
+    _mem_module._store = temp_store
+    yield temp_store
+    _mem_module._store = original_store
+
+
 # ── TestMockMode ───────────────────────────────────────────────────────────────
 
 class TestMockMode:
@@ -169,7 +192,15 @@ class TestFullPipeline:
     """
     End-to-end integration: run the complete LangGraph pipeline in mock mode.
     No API calls are made. Real subprocess execution of generated code.
+
+    isolated_memory is applied to every test so that memory_retrieve_node and
+    memory_save_node use a fresh temp-path ChromaDB instead of the production
+    .chroma_db/.  This makes the tests deterministic regardless of on-disk state.
     """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_memory(self, isolated_memory):
+        """Apply memory isolation to every test in this class."""
 
     def _run_pipeline(self, tmp_workspace, idea="Build a REST API for a todo app",
                       project_id="mock-todo"):
@@ -241,25 +272,16 @@ class TestFullPipeline:
         final = self._run_pipeline(tmp_workspace)
         assert final["debug_attempts"] == 0
 
-    def test_pipeline_memory_saves_architecture(self, tmp_workspace):
+    def test_pipeline_memory_saves_architecture(self, tmp_workspace, isolated_memory):
         """After completion, architecture and project pattern should be stored in Chroma."""
-        from ai_cto.memory.store import ChromaMemoryStore
         from ai_cto.memory.schema import MemoryType
-        import ai_cto.agents.memory as _mem_module
 
-        chroma_path = tmp_workspace / "test_chroma"
-        store = ChromaMemoryStore(db_path=chroma_path)
+        # isolated_memory is the temp ChromaMemoryStore already wired into _store
+        # by the class-level _isolate_memory autouse fixture.
+        self._run_pipeline(tmp_workspace, project_id="mem-test")
 
-        # Reset the shared store singleton and point it at our isolated chroma
-        original_store = _mem_module._store
-        _mem_module._store = store
-        try:
-            final = self._run_pipeline(tmp_workspace, project_id="mem-test")
-        finally:
-            _mem_module._store = original_store
-
-        assert store.count(MemoryType.ARCHITECTURE) >= 1
-        assert store.count(MemoryType.PROJECT_PATTERN) >= 1
+        assert isolated_memory.count(MemoryType.ARCHITECTURE) >= 1
+        assert isolated_memory.count(MemoryType.PROJECT_PATTERN) >= 1
 
     def test_different_ideas_dont_interfere(self, tmp_workspace):
         """Two pipeline runs with different project IDs should not conflict."""

@@ -70,6 +70,7 @@ def main() -> None:
 def _run_new(idea: str, project_id: str) -> None:
     from ai_cto.state import initial_state
     from ai_cto.graph import build_graph
+    from ai_cto.tools.run_logger import RunLogger
 
     print(f"\n{'='*60}")
     print(f"  AI CTO System — Project: {project_id}")
@@ -78,13 +79,18 @@ def _run_new(idea: str, project_id: str) -> None:
 
     state = initial_state(idea=idea, project_id=project_id)
     graph = build_graph()
+    run_log = RunLogger(project_id)
 
     # Stream events so the user sees progress in real time
+    node_state = state
     for event in graph.stream(state):
         node_name = list(event.keys())[0]
         node_state = event[node_name]
         status = node_state.get("status", "?")
         print(f"[{node_name.upper()}] status={status}")
+        run_log.record_event(node_name, node_state)
+
+    run_log.save(node_state)
 
     # Print final result
     final = node_state  # last event state
@@ -126,13 +132,19 @@ def _run_resume(resume_project_id: str) -> None:
 
     graph = build_resume_graph()
 
+    from ai_cto.tools.run_logger import RunLogger
+    run_log = RunLogger(resume_project_id)
+
+    node_state = state
     for event in graph.stream(state):
         node_name = list(event.keys())[0]
         node_state = event[node_name]
         status = node_state.get("status", "?")
         active = node_state.get("active_task_id")
         print(f"[{node_name.upper()}] status={status}  active_task={active}")
+        run_log.record_event(node_name, node_state)
 
+    run_log.save(node_state)
     final = node_state
     print(f"\n{'='*60}")
     if final.get("status") == "done":

@@ -35,11 +35,17 @@ def is_mock_mode() -> bool:
     Return True if mock LLM mode is active.
 
     Checks (in order):
-      1. AI_CTO_MOCK_LLM env var is set to a truthy value
-      2. ANTHROPIC_API_KEY is absent or empty
+      1. AI_CTO_MOCK_LLM env var is set to a truthy value → mock
+      2. AI_CTO_LLM_PROVIDER is set to a non-mock provider → NOT mock
+         (ollama/anthropic are real providers even without an API key)
+      3. ANTHROPIC_API_KEY is absent or empty → mock (fallback)
     """
     if os.environ.get("AI_CTO_MOCK_LLM", "").lower() in ("1", "true", "yes"):
         return True
+    explicit = os.environ.get("AI_CTO_LLM_PROVIDER", "").strip().lower()
+    if explicit and explicit != "mock":
+        # User has explicitly chosen a real provider
+        return False
     if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
         return True
     return False
@@ -92,7 +98,7 @@ MOCK_TASKS: list[TaskItem] = [
 
 # Extended 4-task mock for multi-task demonstrations and verification.
 # Activated by setting AI_CTO_MOCK_EXTENDED=true.
-# All 4 tasks use the same known-good MOCK_MAIN_PY so coding/execution
+# All tasks use the same known-good MOCK_MAIN_PY so coding/execution
 # succeed on every pass — the point is to exercise the orchestration layer.
 MOCK_TASKS_EXTENDED: list[TaskItem] = [
     make_task_item(
@@ -136,6 +142,24 @@ MOCK_TASKS_EXTENDED: list[TaskItem] = [
         priority=4,
         depends_on=[3],
         outputs=["main.py"],
+    ),
+]
+
+# Five-task mock for resume demonstrations.
+# Activated by setting AI_CTO_MOCK_FIVE=true.
+# Adds a 5th task (CLI layer) so the pipeline has enough tasks to stop
+# partway through and show meaningful resume behaviour.
+MOCK_TASKS_FIVE: list[TaskItem] = list(MOCK_TASKS_EXTENDED) + [
+    make_task_item(
+        id=5,
+        title="Add CLI entry point with argparse",
+        description=(
+            "Wrap the CRUD functions in an argparse CLI with 'add', 'list', "
+            "and 'delete' subcommands. Write cli.py and update main.py imports."
+        ),
+        priority=5,
+        depends_on=[4],
+        outputs=["cli.py", "main.py"],
     ),
 ]
 
@@ -378,12 +402,17 @@ def mock_planning_node(state: ProjectState) -> ProjectState:
 def mock_task_manager_node(state: ProjectState) -> ProjectState:
     """Return the pre-defined task list, set the first active task, and persist board.
 
-    Set AI_CTO_MOCK_EXTENDED=true to use the 4-task extended task list.
+    Set AI_CTO_MOCK_FIVE=true     to use the 5-task list (resume demo).
+    Set AI_CTO_MOCK_EXTENDED=true to use the 4-task list (multi-task demo).
+    Default: 1-task list.
     """
     from ai_cto.state import task_history_event
     from ai_cto.tools.task_board import persist_task_board
     log_mock_banner("TaskManagerAgent")
-    if os.environ.get("AI_CTO_MOCK_EXTENDED", "").lower() in ("1", "true", "yes"):
+    if os.environ.get("AI_CTO_MOCK_FIVE", "").lower() in ("1", "true", "yes"):
+        tasks = list(MOCK_TASKS_FIVE)
+        logger.info("[MOCK] Using FIVE-task list.")
+    elif os.environ.get("AI_CTO_MOCK_EXTENDED", "").lower() in ("1", "true", "yes"):
         tasks = list(MOCK_TASKS_EXTENDED)
         logger.info("[MOCK] Using EXTENDED 4-task list.")
     else:
@@ -410,7 +439,12 @@ def mock_task_manager_node(state: ProjectState) -> ProjectState:
 
 
 def mock_coding_node(state: ProjectState) -> ProjectState:
-    """Return the pre-defined todo app source files and write them to disk."""
+    """Return the pre-defined todo app source files and write them to disk.
+
+    Mirrors the Fix-2 accumulation pattern in the real coding_node:
+    current task files are merged onto existing generated_files so prior
+    task outputs are never silently dropped from state.
+    """
     from ai_cto.state import get_active_task, update_task_in_list
     task = get_active_task(state) or state["tasks"][state["current_task_index"]]
     log_mock_banner("CodingAgent")
@@ -418,11 +452,14 @@ def mock_coding_node(state: ProjectState) -> ProjectState:
 
     write_files(project_id=state["project_id"], files=MOCK_GENERATED_FILES)
 
+    # Accumulate: merge task files onto any previously generated files
+    accumulated = {**state.get("generated_files", {}), **MOCK_GENERATED_FILES}
     updated_tasks = update_task_in_list(state["tasks"], task["id"], status="in_progress")
 
     return {
         **state,
-        "generated_files": dict(MOCK_GENERATED_FILES),
+        "generated_files": accumulated,
+        "_current_task_files": dict(MOCK_GENERATED_FILES),  # scoped for TestGenerator
         "tasks": updated_tasks,
         "_entry_point": MOCK_ENTRY_POINT,
         "status": "executing",

@@ -139,6 +139,8 @@ def persist_task_board(state: dict) -> "Path":
     project_dir: Path = _fw.WORKSPACE_ROOT / state["project_id"]
     project_dir.mkdir(parents=True, exist_ok=True)
 
+    from ai_cto.tools.status import get_status_report
+    generated_files: dict = state.get("generated_files", {})
     board = {
         "project_id": state.get("project_id", ""),
         "project_goal": state.get("idea", ""),
@@ -150,6 +152,10 @@ def persist_task_board(state: dict) -> "Path":
         "failed_task_ids": state.get("failed_task_ids", []),
         "blocked_task_ids": state.get("blocked_task_ids", []),
         "task_history": state.get("task_history", []),
+        "debug_retries": state.get("debug_attempts", 0),
+        "generated_files_count": len(generated_files),
+        "generated_files": sorted(generated_files.keys()),
+        "status_report": get_status_report(state),
         "persisted_at": now_iso(),
     }
 

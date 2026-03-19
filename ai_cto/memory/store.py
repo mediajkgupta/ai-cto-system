@@ -79,14 +79,18 @@ class ChromaMemoryStore:
         query: str,
         memory_type: MemoryType,
         n: int = 3,
+        exclude_mock: bool = False,
     ) -> list[MemoryEntry]:
         """
         Semantic search within a single memory type collection.
 
         Args:
-            query       — Natural language query string.
-            memory_type — Which collection to search.
-            n           — Maximum number of results to return.
+            query        — Natural language query string.
+            memory_type  — Which collection to search.
+            n            — Maximum number of results to return.
+            exclude_mock — When True, skip entries tagged run_mode='mock'.
+                           Fetches extra candidates then post-filters in Python
+                           so legacy entries (no run_mode key) are preserved.
 
         Returns:
             List of MemoryEntry objects, best match first.
@@ -100,10 +104,12 @@ class ChromaMemoryStore:
             logger.debug("[MemoryStore] Collection '%s' is empty.", memory_type)
             return []
 
-        actual_n = min(n, count)
+        # Fetch extra candidates when filtering so we can still return n results
+        # after mock entries are removed.
+        fetch_n = min(n * 4, count) if exclude_mock else min(n, count)
         results = collection.query(
             query_texts=[query],
-            n_results=actual_n,
+            n_results=fetch_n,
             include=["documents", "metadatas"],
         )
 
@@ -113,6 +119,8 @@ class ChromaMemoryStore:
         metas = results["metadatas"][0]
 
         for entry_id, doc, meta in zip(ids, docs, metas):
+            if exclude_mock and meta.get("run_mode") == "mock":
+                continue
             entries.append(
                 MemoryEntry(
                     id=entry_id,
@@ -122,11 +130,14 @@ class ChromaMemoryStore:
                 )
             )
 
+        entries = entries[:n]  # cap at requested n after filtering
+
         logger.debug(
-            "[MemoryStore] Search '%s' in %s → %d result(s).",
+            "[MemoryStore] Search '%s' in %s → %d result(s) (exclude_mock=%s).",
             query[:60],
             memory_type,
             len(entries),
+            exclude_mock,
         )
         return entries
 

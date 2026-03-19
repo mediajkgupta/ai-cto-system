@@ -16,8 +16,12 @@ run_all_checks() assembles them and returns a VerificationResult.
 """
 
 import ast
+import os
+import posixpath
 import re
+import subprocess
 import sys
+import tempfile
 import logging
 from typing import TypedDict, Optional
 
@@ -523,6 +527,231 @@ class RuntimeRiskChecker:
         return issues
 
 
+# ── Stack Detection ────────────────────────────────────────────────────────────
+
+_NODE_ENTRY_CANDIDATES = (
+    "server.js", "app.js", "index.js", "main.js",
+    "src/server.js", "src/app.js", "src/index.js",
+)
+
+
+def detect_stack(files: dict[str, str]) -> str:
+    """
+    Detect the primary language stack from the generated file set.
+    Returns 'node', 'python', or 'unknown'.
+
+    Node.js: any .js/.ts file or package.json present.
+    Python:  at least one non-empty .py file present.
+    An empty main.py created as a DebugAgent placeholder does NOT count as Python.
+    """
+    js_files = [p for p in files if p.endswith(".js") or p.endswith(".ts")]
+    has_package_json = any(
+        p == "package.json" or p.endswith("/package.json") for p in files
+    )
+    if js_files or has_package_json:
+        return "node"
+    meaningful_py = [p for p in files if p.endswith(".py") and files[p].strip()]
+    if meaningful_py:
+        return "python"
+    return "unknown"
+
+
+def detect_node_entry(files: dict[str, str]) -> str | None:
+    """
+    Return the first non-empty JS entry-point file found, or None.
+
+    Priority order: server.js > app.js > index.js > main.js > top-level .js > any .js
+    """
+    for candidate in _NODE_ENTRY_CANDIDATES:
+        if candidate in files and files[candidate].strip():
+            return candidate
+    # Top-level non-empty .js file
+    for path in sorted(files):
+        if "/" not in path and path.endswith(".js") and files[path].strip():
+            return path
+    # Any non-empty .js file
+    for path in sorted(files):
+        if path.endswith(".js") and files[path].strip():
+            return path
+    return None
+
+
+# ── 6. Empty Entry Point Checker ───────────────────────────────────────────────
+
+class EmptyEntryPointChecker:
+    """
+    Error when the entry point file exists but contains no code.
+
+    This blocks the 'create empty main.py to satisfy entry-point check' bypass
+    that DebugAgent uses when it cannot solve cross-language entry point mismatches.
+    """
+
+    NAME = "empty_entry"
+
+    def check(
+        self, files: dict[str, str], entry_point: str
+    ) -> list[VerificationIssue]:
+        if not entry_point or entry_point not in files:
+            return []
+        if not files[entry_point].strip():
+            return [_issue(
+                "error", self.NAME, entry_point,
+                f"Entry point '{entry_point}' exists but is empty — no code was generated.",
+            )]
+        return []
+
+
+# ── 7. Node.js Checker ─────────────────────────────────────────────────────────
+
+_LOCAL_REQUIRE_RE = re.compile(r"""require\s*\(\s*['"](\.[^'"]+)['"]\s*\)""")
+_NODE_ERR_LINENO_RE = re.compile(r":(\d+)\n")
+_NODE_SYNTAX_ERR_RE = re.compile(r"SyntaxError: (.+)")
+
+
+class NodeJsChecker:
+    """
+    Node.js-specific static checks. Only active when detect_stack() returns 'node'.
+
+    Checks (all ERROR severity):
+      1. At least one non-empty JS entry file exists (server.js / app.js / index.js).
+      2. No .js file is completely empty.
+      3. JS syntax is valid — `node --check` on each .js file (requires Node ≥ 6).
+      4. Local require('./x') and require('../x') paths exist in the generated file set.
+    """
+
+    NAME = "nodejs"
+
+    def check(
+        self, files: dict[str, str], entry_point: str
+    ) -> list[VerificationIssue]:
+        if detect_stack(files) != "node":
+            return []
+
+        issues: list[VerificationIssue] = []
+        js_files = {p: c for p, c in files.items() if p.endswith(".js")}
+
+        issues.extend(self._check_entry_exists(files))
+        issues.extend(self._check_empty_js_files(js_files))
+        issues.extend(self._check_js_syntax(js_files))
+        issues.extend(self._check_require_targets(files, js_files))
+        return issues
+
+    # ── sub-checks ────────────────────────────────────────────────────────────
+
+    def _check_entry_exists(
+        self, files: dict[str, str]
+    ) -> list[VerificationIssue]:
+        if detect_node_entry(files) is None:
+            return [_issue(
+                "error", self.NAME, "",
+                "Node.js project has no non-empty entry file "
+                "(expected one of: server.js, app.js, index.js).",
+            )]
+        return []
+
+    def _check_empty_js_files(
+        self, js_files: dict[str, str]
+    ) -> list[VerificationIssue]:
+        return [
+            _issue(
+                "error", self.NAME, path,
+                f"'{path}' is empty — no JavaScript code was generated.",
+            )
+            for path, content in js_files.items()
+            if not content.strip()
+        ]
+
+    def _check_js_syntax(
+        self, js_files: dict[str, str]
+    ) -> list[VerificationIssue]:
+        """Run `node --check` on each .js file via a temp file."""
+        # Verify node is available before attempting any checks
+        try:
+            subprocess.run(
+                ["node", "--version"],
+                capture_output=True, timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            logger.warning(
+                "[NodeJsChecker] `node` not found on PATH — skipping JS syntax checks."
+            )
+            return []
+
+        issues: list[VerificationIssue] = []
+        for path, content in js_files.items():
+            result = self._node_check(content)
+            if result is not None:
+                line, msg = result
+                issues.append(_issue(
+                    "error", self.NAME, path,
+                    f"JS SyntaxError: {msg}",
+                    line,
+                ))
+        return issues
+
+    def _node_check(
+        self, content: str
+    ) -> tuple[int | None, str] | None:
+        """
+        Write content to a temp file, run `node --check`, parse the error output.
+        Returns (line_number_or_None, message) on syntax error, None on success.
+        """
+        tmp: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".js", mode="w", encoding="utf-8", delete=False
+            ) as f:
+                f.write(content)
+                tmp = f.name
+            result = subprocess.run(
+                ["node", "--check", tmp],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return None
+            stderr = result.stderr
+            lineno_match = _NODE_ERR_LINENO_RE.search(stderr)
+            msg_match = _NODE_SYNTAX_ERR_RE.search(stderr)
+            line = int(lineno_match.group(1)) if lineno_match else None
+            msg = (
+                msg_match.group(1)
+                if msg_match
+                else (stderr.strip().splitlines()[-1] if stderr.strip() else "unknown error")
+            )
+            return (line, msg)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+
+    def _check_require_targets(
+        self, files: dict[str, str], js_files: dict[str, str]
+    ) -> list[VerificationIssue]:
+        """
+        For each local require('./x') or require('../x'), verify the target
+        exists in the generated file set (with or without .js extension).
+        """
+        issues: list[VerificationIssue] = []
+        for path, content in js_files.items():
+            file_dir = path.rsplit("/", 1)[0] if "/" in path else ""
+            for match in _LOCAL_REQUIRE_RE.finditer(content):
+                req = match.group(1)
+                base = posixpath.join(file_dir, req) if file_dir else req
+                resolved = posixpath.normpath(base)
+                candidates = [
+                    resolved,
+                    resolved + ".js",
+                    resolved + "/index.js",
+                ]
+                if not any(c in files for c in candidates):
+                    issues.append(_issue(
+                        "error", self.NAME, path,
+                        f"require('{req}') — '{resolved}.js' not found in generated files.",
+                    ))
+        return issues
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────────
 
 _CHECKERS = [
@@ -531,6 +760,8 @@ _CHECKERS = [
     DependencyChecker(),
     ArchitectureChecker(),
     RuntimeRiskChecker(),
+    EmptyEntryPointChecker(),
+    NodeJsChecker(),
 ]
 
 

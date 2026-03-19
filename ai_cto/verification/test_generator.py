@@ -18,7 +18,7 @@ Design decisions:
 import json
 import re
 import logging
-from anthropic import Anthropic
+from ai_cto.providers import get_provider
 from ai_cto.mock_llm import is_mock_mode, mock_generate_tests
 
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ def generate_tests(
         project_id,
     )
 
-    client = Anthropic()
+    provider = get_provider()
 
     user_message = (
         f"Architecture:\n{architecture}\n\n"
@@ -89,17 +89,14 @@ def generate_tests(
     )
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2048,
+        raw = provider.complete(
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}]
+            user=user_message,
+            max_tokens=2048,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[TestGenerator] API call failed: %s — skipping test generation.", exc)
         return {}
-
-    raw = response.content[0].text
     logger.debug("[TestGenerator] Raw response:\n%s", raw)
 
     json_str = _extract_json(raw)

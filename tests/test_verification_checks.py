@@ -12,6 +12,10 @@ from ai_cto.verification.checks import (
     DependencyChecker,
     ArchitectureChecker,
     RuntimeRiskChecker,
+    EmptyEntryPointChecker,
+    NodeJsChecker,
+    detect_stack,
+    detect_node_entry,
     run_all_checks,
     VerificationResult,
 )
@@ -284,3 +288,319 @@ class TestRunAllChecks:
         assert "security" in checks_found
         assert "dependency" in checks_found
         assert "runtime" in checks_found
+
+
+# ── detect_stack() ─────────────────────────────────────────────────────────────
+
+class TestDetectStack:
+    def test_js_files_detected_as_node(self):
+        assert detect_stack({"server.js": "const x = 1"}) == "node"
+
+    def test_package_json_detected_as_node(self):
+        assert detect_stack({"package.json": "{}"}) == "node"
+
+    def test_py_files_detected_as_python(self):
+        assert detect_stack({"app.py": "x = 1"}) == "python"
+
+    def test_empty_main_py_only_is_unknown(self):
+        # An empty main.py (DebugAgent placeholder) must NOT count as Python
+        assert detect_stack({"main.py": ""}) == "unknown"
+        assert detect_stack({"main.py": "   \n  "}) == "unknown"
+
+    def test_js_and_py_mixed_detected_as_node(self):
+        # JS presence wins over Python
+        assert detect_stack({"server.js": "x", "main.py": ""}) == "node"
+
+    def test_empty_files_dict_is_unknown(self):
+        assert detect_stack({}) == "unknown"
+
+
+# ── detect_node_entry() ────────────────────────────────────────────────────────
+
+class TestDetectNodeEntry:
+    def test_server_js_preferred(self):
+        files = {"server.js": "x", "app.js": "y", "index.js": "z"}
+        assert detect_node_entry(files) == "server.js"
+
+    def test_app_js_when_no_server(self):
+        assert detect_node_entry({"app.js": "x"}) == "app.js"
+
+    def test_empty_server_js_skipped(self):
+        files = {"server.js": "", "app.js": "x"}
+        assert detect_node_entry(files) == "app.js"
+
+    def test_returns_none_when_all_empty(self):
+        assert detect_node_entry({"server.js": "", "app.js": "  "}) is None
+
+    def test_returns_none_for_empty_files(self):
+        assert detect_node_entry({}) is None
+
+    def test_falls_back_to_any_nonempty_js(self):
+        files = {"routes/api.js": "module.exports = {}"}
+        assert detect_node_entry(files) == "routes/api.js"
+
+
+# ── EmptyEntryPointChecker ─────────────────────────────────────────────────────
+
+class TestEmptyEntryPointChecker:
+    checker = EmptyEntryPointChecker()
+
+    def test_empty_entry_is_error(self):
+        files = {"main.py": ""}
+        issues = self.checker.check(files, "main.py")
+        assert len(issues) == 1
+        assert issues[0]["severity"] == "error"
+        assert issues[0]["check"] == "empty_entry"
+
+    def test_whitespace_only_entry_is_error(self):
+        files = {"main.py": "   \n\t\n  "}
+        issues = self.checker.check(files, "main.py")
+        assert len(issues) == 1
+
+    def test_nonempty_entry_passes(self):
+        files = {"main.py": "x = 1\n"}
+        assert self.checker.check(files, "main.py") == []
+
+    def test_missing_entry_produces_no_issues(self):
+        # ArchitectureChecker handles missing entry; this checker only handles empty
+        assert self.checker.check({}, "main.py") == []
+
+    def test_empty_js_entry_is_error(self):
+        files = {"server.js": ""}
+        issues = self.checker.check(files, "server.js")
+        assert len(issues) == 1
+        assert "empty" in issues[0]["message"].lower()
+
+
+# ── NodeJsChecker ──────────────────────────────────────────────────────────────
+
+_VALID_SERVER = "const express = require('express');\nconst app = express();\nmodule.exports = app;\n"
+_VALID_MODEL  = "const mongoose = require('mongoose');\nconst s = new mongoose.Schema({title: String});\nmodule.exports = mongoose.model('T', s);\n"
+_VALID_ROUTES = "const express = require('express');\nconst router = express.Router();\nrouter.get('/', (req, res) => res.json([]));\nmodule.exports = router;\n"
+
+
+class TestNodeJsCheckerNotNodeProject:
+    checker = NodeJsChecker()
+
+    def test_python_project_not_checked(self):
+        """NodeJsChecker must be silent on pure Python projects."""
+        files = {"app.py": "import flask\napp = flask.Flask(__name__)\n"}
+        assert self.checker.check(files, "app.py") == []
+
+    def test_empty_files_not_checked(self):
+        assert self.checker.check({}, "main.py") == []
+
+
+class TestNodeJsCheckerEntryPoint:
+    checker = NodeJsChecker()
+
+    def test_no_entry_file_is_error(self):
+        # All JS files present but all empty
+        files = {"server.js": "", "app.js": "  "}
+        issues = self.checker.check(files, "server.js")
+        errors = [i for i in issues if i["check"] == "nodejs" and i["severity"] == "error"]
+        assert any("no non-empty entry" in i["message"].lower() for i in errors)
+
+    def test_valid_server_js_passes_entry_check(self):
+        files = {"server.js": _VALID_SERVER}
+        issues = self.checker.check(files, "server.js")
+        entry_errors = [i for i in issues if "no non-empty entry" in i["message"].lower()]
+        assert entry_errors == []
+
+
+class TestNodeJsCheckerEmptyFiles:
+    checker = NodeJsChecker()
+
+    def test_empty_js_file_is_error(self):
+        files = {"server.js": _VALID_SERVER, "db.js": ""}
+        issues = self.checker.check(files, "server.js")
+        empty_errors = [i for i in issues if "empty" in i["message"].lower() and i["file"] == "db.js"]
+        assert len(empty_errors) == 1
+        assert empty_errors[0]["severity"] == "error"
+
+    def test_nonempty_js_files_no_empty_errors(self):
+        files = {"server.js": _VALID_SERVER, "db.js": "module.exports = {};\n"}
+        issues = self.checker.check(files, "server.js")
+        empty_errors = [i for i in issues if "empty" in i["message"].lower()]
+        assert empty_errors == []
+
+
+class TestNodeJsCheckerSyntax:
+    checker = NodeJsChecker()
+
+    def test_valid_js_passes_syntax(self):
+        files = {"server.js": _VALID_SERVER}
+        issues = self.checker.check(files, "server.js")
+        syntax_errors = [i for i in issues if "SyntaxError" in i["message"]]
+        assert syntax_errors == []
+
+    def test_invalid_js_syntax_is_error(self):
+        bad_js = "const x = {a: 1\nb: 2};\n"   # missing comma
+        files = {"server.js": bad_js}
+        issues = self.checker.check(files, "server.js")
+        syntax_errors = [i for i in issues if "SyntaxError" in i["message"]]
+        assert len(syntax_errors) == 1
+        assert syntax_errors[0]["severity"] == "error"
+        assert syntax_errors[0]["file"] == "server.js"
+
+    def test_schema_missing_comma_is_syntax_error(self):
+        """Exact pattern from the real Ollama run: missing comma in Mongoose schema."""
+        bad_model = (
+            "const mongoose = require('mongoose');\n"
+            "const taskSchema = new mongoose.Schema({\n"
+            "  title: { type: String, required: true },\n"
+            "  status: { type: String }\n"
+            "  createdAt: { type: Date }\n"   # <-- missing comma before createdAt
+            "});\n"
+            "module.exports = mongoose.model('Task', taskSchema);\n"
+        )
+        files = {"models/task.js": bad_model}
+        issues = self.checker.check(files, "server.js")
+        syntax_errors = [i for i in issues if "SyntaxError" in i["message"]]
+        assert len(syntax_errors) == 1
+        assert syntax_errors[0]["file"] == "models/task.js"
+
+    def test_syntax_error_includes_line_number(self):
+        bad_js = "const x = 1;\nconst y = {a: 1\nb: 2};\n"
+        files = {"server.js": bad_js}
+        issues = self.checker.check(files, "server.js")
+        syntax_errors = [i for i in issues if "SyntaxError" in i["message"]]
+        assert syntax_errors[0]["line"] is not None
+
+
+class TestNodeJsCheckerRequireTargets:
+    checker = NodeJsChecker()
+
+    def test_missing_local_require_is_error(self):
+        """require('../controllers/task') when controllers/task.js doesn't exist."""
+        files = {
+            "server.js": _VALID_SERVER,
+            "api/tasks.js": "const T = require('../controllers/task');\n",
+        }
+        issues = self.checker.check(files, "server.js")
+        req_errors = [i for i in issues if "not found in generated files" in i["message"]]
+        assert len(req_errors) == 1
+        assert req_errors[0]["file"] == "api/tasks.js"
+        assert req_errors[0]["severity"] == "error"
+
+    def test_present_local_require_passes(self):
+        files = {
+            "server.js": _VALID_SERVER,
+            "api/tasks.js": "const T = require('../controllers/task');\n",
+            "controllers/task.js": "module.exports = {};\n",
+        }
+        issues = self.checker.check(files, "server.js")
+        req_errors = [i for i in issues if "not found in generated files" in i["message"]]
+        assert req_errors == []
+
+    def test_require_without_dot_not_checked(self):
+        """Non-local require('mongoose') must not trigger file-existence check."""
+        files = {"server.js": "const m = require('mongoose');\n"}
+        issues = self.checker.check(files, "server.js")
+        req_errors = [i for i in issues if "not found in generated files" in i["message"]]
+        assert req_errors == []
+
+    def test_require_js_extension_optional(self):
+        """require('./db') should resolve to db.js."""
+        files = {
+            "server.js": "const db = require('./db');\n",
+            "db.js": "module.exports = {};\n",
+        }
+        issues = self.checker.check(files, "server.js")
+        req_errors = [i for i in issues if "not found in generated files" in i["message"]]
+        assert req_errors == []
+
+
+# ── Full pipeline false-positive regression test ────────────────────────────────
+
+class TestNodeJsFalsePositiveRegression:
+    """
+    Reproduces the exact file set from the failing Ollama run and verifies the
+    new verifier catches all issues that caused the false PASS.
+    """
+
+    def _ollama_run_files(self):
+        return {
+            # server.js — empty (0 bytes, as produced)
+            "server.js": "",
+            # main.py — empty placeholder created by DebugAgent
+            "main.py": "",
+            # db.js — valid connection string
+            "db.js": (
+                "\nconst mongoose = require('mongoose');\n"
+                "mongoose.connect(process.env.MONGODB_URL || 'mongodb://localhost:27017/task-tracker', "
+                "{ useNewUrlParser: true, useUnifiedTopology: true });\n"
+            ),
+            # models/task.js — missing comma syntax error
+            "models/task.js": (
+                "\nconst mongoose = require('mongoose');\n"
+                "\nconst taskSchema = new mongoose.Schema({\n"
+                "title: {\n  type: String,\n  required: true\n},\n"
+                "description: {\n  type: String,\n},\n"
+                "status: {\n  type: String,\n  enum: ['Not Started', 'In Progress', 'Completed'],\n  default: 'Not Started'\n}\n"
+                "createdAt: {\n  type: Date,\n  default: Date.now\n}\n"
+                "});\n\nmodule.exports = mongoose.model('Task', taskSchema);\n"
+            ),
+            # api/tasks.js — requires controllers/task which doesn't exist
+            "api/tasks.js": (
+                "\nconst express = require('express');\n"
+                "const router = express.Router();\n"
+                "const TaskController = require('../controllers/task');\n"
+                "router.get('/', TaskController.getTasks);\n"
+                "exports = module.exports = router;\n"
+            ),
+        }
+
+    def test_stack_detected_as_node(self):
+        assert detect_stack(self._ollama_run_files()) == "node"
+
+    def test_node_entry_is_db_js_not_server(self):
+        """server.js is empty, so detect_node_entry skips it and falls back."""
+        entry = detect_node_entry(self._ollama_run_files())
+        assert entry != "server.js"   # server.js is empty
+        assert entry is not None       # something non-empty found
+
+    def test_run_all_checks_fails(self):
+        """The false-positive PASS must no longer occur."""
+        files = self._ollama_run_files()
+        result = run_all_checks(files, "server.js")
+        assert result["passed"] is False
+
+    def test_empty_server_js_caught(self):
+        files = self._ollama_run_files()
+        result = run_all_checks(files, "server.js")
+        empty_errors = [
+            i for i in result["issues"]
+            if i["severity"] == "error" and "empty" in i["message"].lower()
+            and i["file"] == "server.js"
+        ]
+        assert len(empty_errors) >= 1
+
+    def test_syntax_error_in_model_caught(self):
+        files = self._ollama_run_files()
+        result = run_all_checks(files, "server.js")
+        syntax_errors = [
+            i for i in result["issues"]
+            if i["severity"] == "error" and "SyntaxError" in i["message"]
+            and "task.js" in i["file"]
+        ]
+        assert len(syntax_errors) >= 1
+
+    def test_missing_controllers_task_caught(self):
+        files = self._ollama_run_files()
+        result = run_all_checks(files, "server.js")
+        missing_errors = [
+            i for i in result["issues"]
+            if i["severity"] == "error" and "controllers/task" in i["message"]
+        ]
+        assert len(missing_errors) >= 1
+
+    def test_empty_main_py_caught(self):
+        files = self._ollama_run_files()
+        result = run_all_checks(files, "main.py")
+        empty_errors = [
+            i for i in result["issues"]
+            if i["severity"] == "error" and "empty" in i["message"].lower()
+            and i["file"] == "main.py"
+        ]
+        assert len(empty_errors) >= 1

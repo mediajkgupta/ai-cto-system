@@ -14,7 +14,7 @@ The Coding Agent runs once per task (and again after each debug patch).
 import json
 import re
 import logging
-from anthropic import Anthropic
+from ai_cto.providers import get_provider
 from ai_cto.state import ProjectState, get_active_task, update_task_in_list
 from ai_cto.tools.file_writer import write_files
 from ai_cto.mock_llm import is_mock_mode, mock_coding_node
@@ -65,20 +65,18 @@ def coding_node(state: ProjectState) -> ProjectState:
     if is_mock_mode():
         return mock_coding_node(state)
 
-    client = Anthropic()
+    provider = get_provider()
     user_message = _build_user_message(state, task)
 
     parsed = None
     last_error = None
     for attempt in range(1, MAX_PARSE_RETRIES + 2):  # 1 .. MAX_PARSE_RETRIES+1
         try:
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
+            raw = provider.complete(
                 system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_message}],
+                user=user_message,
+                max_tokens=4096,
             )
-            raw = response.content[0].text
             logger.debug("[CodingAgent] Raw response (attempt %d):\n%s", attempt, raw)
 
             json_str = _extract_json(raw)
@@ -109,18 +107,25 @@ def coding_node(state: ProjectState) -> ProjectState:
             "status": "verifying_failed",
         }
 
-    generated_files: dict[str, str] = parsed["files"]
+    current_task_files: dict[str, str] = parsed["files"]
     entry_point: str = parsed.get("entry_point", "main.py")
 
-    # Materialise files to workspace/<project_id>/
+    # Materialise only the new files to workspace/<project_id>/
     write_files(
         project_id=state["project_id"],
-        files=generated_files,
+        files=current_task_files,
     )
 
+    # Accumulate: merge this task's files onto all files from prior tasks.
+    # Later tasks can overwrite earlier files, but earlier files are never
+    # silently dropped from state — they remain available for verification,
+    # execution, and debug context.
+    accumulated_files = {**state.get("generated_files", {}), **current_task_files}
+
     logger.info(
-        "[CodingAgent] Wrote %d file(s). Entry point: %s",
-        len(generated_files),
+        "[CodingAgent] Wrote %d file(s) (total accumulated: %d). Entry point: %s",
+        len(current_task_files),
+        len(accumulated_files),
         entry_point,
     )
 
@@ -129,10 +134,10 @@ def coding_node(state: ProjectState) -> ProjectState:
 
     return {
         **state,
-        "generated_files": generated_files,
+        "generated_files": accumulated_files,
+        "_current_task_files": current_task_files,  # scoped for TestGenerator
         "tasks": updated_tasks,
         "status": "executing",
-        # Store entry_point in generated_files metadata via a sentinel key
         "_entry_point": entry_point,
     }
 

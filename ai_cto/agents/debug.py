@@ -21,7 +21,7 @@ V2 changes from V1:
 import json
 import re
 import logging
-from anthropic import Anthropic
+from ai_cto.providers import get_provider
 from ai_cto.state import (
     ProjectState, get_active_task, update_task_in_list, now_iso,
     task_history_event,
@@ -29,6 +29,7 @@ from ai_cto.state import (
 from ai_cto.tools.file_writer import write_files
 from ai_cto.tools.task_board import mark_task_failed, persist_task_board
 from ai_cto.mock_llm import is_mock_mode, mock_debug_node
+from ai_cto.agents.memory import retrieve_debug_solutions
 
 logger = logging.getLogger(__name__)
 
@@ -160,12 +161,18 @@ def debug_node(state: ProjectState) -> ProjectState:
         return result
 
     # ── Real LLM call ──────────────────────────────────────────────────────────
-    client = Anthropic()
+    provider = get_provider()
 
-    memory_context = state.get("memory_context", "")
+    # Fetch debug solutions from memory store relevant to this specific error.
+    # This is a direct store query (not the state.memory_context which only
+    # contains architecture + project patterns from the start of the run).
+    debug_memory = retrieve_debug_solutions(
+        state["error_context"],
+        exclude_mock=not is_mock_mode(),
+    )
     user_message = ""
-    if memory_context:
-        user_message += f"Past debug solutions for reference:\n{memory_context}\n\n---\n\n"
+    if debug_memory:
+        user_message += f"{debug_memory}\n\n---\n\n"
 
     user_message += (
         f"Error output:\n{state['error_context']}\n\n"
@@ -173,14 +180,11 @@ def debug_node(state: ProjectState) -> ProjectState:
         f"{json.dumps(state['generated_files'], indent=2)}"
     )
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
+    raw = provider.complete(
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}]
+        user=user_message,
+        max_tokens=4096,
     )
-
-    raw = response.content[0].text
     logger.debug("[DebugAgent] Raw response:\n%s", raw)
 
     json_str = _extract_json(raw)

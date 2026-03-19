@@ -13,7 +13,7 @@ Task decomposition is handled by the TaskManagerAgent which runs next.
 import json
 import re
 import logging
-from anthropic import Anthropic
+from ai_cto.providers import get_provider
 from ai_cto.state import ProjectState
 from ai_cto.mock_llm import is_mock_mode, mock_planning_node
 
@@ -50,7 +50,7 @@ def planning_node(state: ProjectState) -> ProjectState:
     if is_mock_mode():
         return mock_planning_node(state)
 
-    client = Anthropic()
+    provider = get_provider()
 
     # Prepend any retrieved memory context to enrich the planning prompt
     memory_context = state.get("memory_context", "")
@@ -59,19 +59,11 @@ def planning_node(state: ProjectState) -> ProjectState:
         user_content = f"{memory_context}\n\n---\n\n{user_content}"
         logger.info("[PlanningAgent] Injecting %d chars of memory context.", len(memory_context))
 
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2048,
+    raw = provider.complete(
         system=SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": user_content,
-            }
-        ]
+        user=user_content,
+        max_tokens=2048,
     )
-
-    raw = response.content[0].text
     logger.debug("[PlanningAgent] Raw response:\n%s", raw)
 
     json_str = _extract_json(raw)

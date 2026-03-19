@@ -23,6 +23,7 @@ import logging
 import ai_cto.tools.file_writer as _fw
 from ai_cto.state import ProjectState, ExecutionResult
 from ai_cto.tools.sandbox import run_in_docker, run_in_subprocess, docker_available
+from ai_cto.verification.checks import detect_stack, detect_node_entry
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,8 @@ def execution_node(state: ProjectState) -> ProjectState:
         state.generated_files (on disk)  →  state.execution_result
     """
     project_id = state["project_id"]
-    entry_point = state.get("_entry_point", "main.py")
+    files = state.get("generated_files", {})
+    entry_point = _resolve_entry_point(files, state.get("_entry_point", "main.py"))
 
     logger.info(
         "[ExecutionAgent] Running project '%s', entry: %s",
@@ -57,6 +59,7 @@ def execution_node(state: ProjectState) -> ProjectState:
         result = run_in_docker(
             workspace_path=workspace_path,
             entry_point=entry_point,
+            files=files,
             timeout=EXECUTION_TIMEOUT,
         )
     else:
@@ -67,6 +70,7 @@ def execution_node(state: ProjectState) -> ProjectState:
         result = run_in_subprocess(
             workspace_path=workspace_path,
             entry_point=entry_point,
+            files=files,
             timeout=EXECUTION_TIMEOUT,
         )
 
@@ -142,6 +146,30 @@ def execution_node(state: ProjectState) -> ProjectState:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _resolve_entry_point(files: dict, entry_point: str) -> str:
+    """
+    Return the correct entry point for the detected language stack.
+
+    For Node.js projects, overrides a missing/empty entry point (or the Python
+    default 'main.py') with the best JS entry file found in generated_files.
+    Mirrors the same logic used by VerificationAgent so both stages agree.
+    """
+    stack = detect_stack(files)
+    if stack == "node":
+        current_is_empty = not files.get(entry_point, "").strip()
+        current_is_python_default = entry_point == "main.py"
+        if current_is_empty or current_is_python_default:
+            js_entry = detect_node_entry(files)
+            if js_entry:
+                logger.info(
+                    "[ExecutionAgent] Node.js stack detected — overriding entry '%s' → '%s'.",
+                    entry_point,
+                    js_entry,
+                )
+                return js_entry
+    return entry_point
+
 
 def _workspace_path(project_id: str) -> str:
     """

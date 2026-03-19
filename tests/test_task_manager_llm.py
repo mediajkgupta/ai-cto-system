@@ -28,22 +28,19 @@ from ai_cto.state import initial_state, make_task_item
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 
-def _llm_response(tasks: list) -> MagicMock:
-    """Return a mock Anthropic Message containing tasks as JSON text."""
-    msg = MagicMock()
-    msg.content = [MagicMock()]
-    msg.content[0].text = json.dumps({"tasks": tasks})
-    return msg
+def _llm_response(tasks: list) -> str:
+    """Return a JSON string containing tasks (mimics provider.complete() return value)."""
+    return json.dumps({"tasks": tasks})
 
 
 def _mock_anthropic(monkeypatch, tasks: list) -> MagicMock:
-    """Patch Anthropic() in task_manager so it returns a fixed task list."""
-    mock_client = MagicMock()
-    mock_client.messages.create.return_value = _llm_response(tasks)
-    monkeypatch.setattr("ai_cto.agents.task_manager.Anthropic", lambda: mock_client)
+    """Patch get_provider() in task_manager so it returns a fixed task list."""
+    mock_provider = MagicMock()
+    mock_provider.complete.return_value = _llm_response(tasks)
+    monkeypatch.setattr("ai_cto.agents.task_manager.get_provider", lambda: mock_provider)
     monkeypatch.delenv("AI_CTO_MOCK_LLM", raising=False)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
-    return mock_client
+    return mock_provider
 
 
 def _state(**overrides):
@@ -70,7 +67,9 @@ def _llm_task(id, title=None, priority=5, depends_on=None, outputs=None):
         "description": f"LLM-generated description for task {id}",
         "priority": priority,
         "depends_on": depends_on or [],
-        "outputs": outputs or [],
+        # Default to a unique source-code file so the filter doesn't reject
+        # tasks that don't need a specific output in the test scenario.
+        "outputs": outputs if outputs is not None else [f"module_{id}.py"],
     }
 
 
@@ -323,11 +322,15 @@ class TestUserMessageContext:
         assert "Failed" in msg or "failed" in msg
         assert "NameError on line 5" in msg
 
-    def test_memory_context_prepended(self):
+    def test_memory_context_not_injected(self):
+        """memory_context is intentionally excluded from the task manager prompt.
+        It is already consumed by PlanningAgent; injecting it here would add ~500
+        tokens and push CPU prefill past the socket timeout on local inference."""
         from ai_cto.agents.task_manager import _build_user_message
         state = _state(memory_context="## Past Architecture\nsome useful context")
         msg = _build_user_message(state)
-        assert msg.startswith("Past relevant")
+        assert "Past relevant" not in msg
+        assert "Past Architecture" not in msg
 
     def test_architecture_always_included(self):
         from ai_cto.agents.task_manager import _build_user_message
@@ -430,20 +433,14 @@ class TestRetryOnParseFailure:
         monkeypatch.delenv("AI_CTO_MOCK_LLM", raising=False)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
 
-        bad = MagicMock()
-        bad.content = [MagicMock()]
-        bad.content[0].text = "not json at all !!!"
-
-        good = _llm_response([_llm_task(1)])
-
-        mock_client = MagicMock()
-        mock_client.messages.create.side_effect = [bad, good]
-        monkeypatch.setattr("ai_cto.agents.task_manager.Anthropic", lambda: mock_client)
+        mock_provider = MagicMock()
+        mock_provider.complete.side_effect = ["not json at all !!!", _llm_response([_llm_task(1)])]
+        monkeypatch.setattr("ai_cto.agents.task_manager.get_provider", lambda: mock_provider)
 
         from ai_cto.agents.task_manager import task_manager_node
         result = task_manager_node(_state())
         assert result["active_task_id"] == 1
-        assert mock_client.messages.create.call_count == 2
+        assert mock_provider.complete.call_count == 2
 
     def test_raises_runtime_error_after_all_retries(self, tmp_path, monkeypatch):
         """If every attempt returns bad JSON, RuntimeError is raised."""
@@ -451,13 +448,9 @@ class TestRetryOnParseFailure:
         monkeypatch.delenv("AI_CTO_MOCK_LLM", raising=False)
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
 
-        bad = MagicMock()
-        bad.content = [MagicMock()]
-        bad.content[0].text = "still bad json"
-
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = bad
-        monkeypatch.setattr("ai_cto.agents.task_manager.Anthropic", lambda: mock_client)
+        mock_provider = MagicMock()
+        mock_provider.complete.return_value = "still bad json"
+        monkeypatch.setattr("ai_cto.agents.task_manager.get_provider", lambda: mock_provider)
 
         from ai_cto.agents.task_manager import task_manager_node
         with pytest.raises(RuntimeError, match="failed to produce valid JSON"):
@@ -490,3 +483,215 @@ class TestBoardPersistence:
         task_manager_node(_state())
         data = json.loads((tmp_path / "crm-test" / "task_board.json").read_text())
         assert data["project_status"] == "active"
+
+
+# ── Deterministic post-processing filter ────────────────────────────────────────
+
+class TestFilterTasks:
+    """Unit tests for _filter_tasks() and _classify_task() helper functions."""
+
+    def _t(self, id, title, outputs):
+        return make_task_item(
+            id=id, title=title,
+            description=f"desc {id}",
+            outputs=outputs,
+        )
+
+    # ── _classify_task ──────────────────────────────────────────────────────
+
+    def test_setup_task_rejected_by_title(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Setup Project and Install Dependencies", ["package.json"])
+        reason = _classify_task(t)
+        assert reason is not None
+        assert "setup" in reason.lower() or "install" in reason.lower()
+
+    def test_test_task_rejected_by_title(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Write Unit Tests", ["tests/test_app.py"])
+        reason = _classify_task(t)
+        assert reason is not None
+
+    def test_test_task_rejected_by_output_path(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Quality Checks", ["tests/task.test.js", "tests/user.test.js"])
+        reason = _classify_task(t)
+        assert reason is not None
+        assert "test" in reason.lower()
+
+    def test_dockerfile_task_rejected_by_output(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Containerize the Application", ["Dockerfile"])
+        reason = _classify_task(t)
+        assert reason is not None
+
+    def test_docker_task_rejected_by_title(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Dockerize the Application", ["app/main.py"])
+        reason = _classify_task(t)
+        assert reason is not None
+        assert "docker" in reason.lower()
+
+    def test_no_outputs_rejected(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Write business logic", [])
+        reason = _classify_task(t)
+        assert reason is not None
+        assert "no output" in reason.lower()
+
+    def test_valid_coding_task_accepted(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Implement CRUD Operations", ["controllers/task.js"])
+        assert _classify_task(t) is None
+
+    def test_valid_auth_task_accepted(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Implement Authentication Middleware", ["middlewares/auth.js"])
+        assert _classify_task(t) is None
+
+    def test_valid_schema_task_accepted(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Design Database Schema", ["models/task.js"])
+        assert _classify_task(t) is None
+
+    def test_spec_output_rejected(self):
+        from ai_cto.agents.task_manager import _classify_task
+        t = self._t(1, "Verify endpoints", ["api.spec.ts"])
+        assert _classify_task(t) is not None
+
+    # ── _filter_tasks ───────────────────────────────────────────────────────
+
+    def test_filter_removes_setup_test_deploy(self):
+        from ai_cto.agents.task_manager import _filter_tasks
+        tasks = [
+            self._t(1, "Setup Project and Install Dependencies", ["package.json"]),
+            self._t(2, "Design Database Schema", ["models/task.js"]),
+            self._t(3, "Implement CRUD Operations", ["controllers/task.js"]),
+            self._t(4, "Implement User Service", ["controllers/user.js"]),
+            self._t(5, "Implement Authentication Middleware", ["middlewares/auth.js"]),
+            self._t(6, "Write Unit Tests", ["tests/task.test.js", "tests/user.test.js"]),
+            self._t(7, "Dockerize the Application", ["Dockerfile"]),
+        ]
+        kept, removed = _filter_tasks(tasks, protected_ids=set())
+        kept_ids = {t["id"] for t in kept}
+        removed_ids = {e["task"]["id"] for e in removed}
+        assert kept_ids == {2, 3, 4, 5}
+        assert removed_ids == {1, 6, 7}
+
+    def test_protected_tasks_never_filtered(self):
+        from ai_cto.agents.task_manager import _filter_tasks
+        tasks = [
+            self._t(1, "Setup Project (completed)", ["package.json"]),  # would be rejected
+            self._t(2, "Real coding work", ["app.py"]),
+        ]
+        kept, removed = _filter_tasks(tasks, protected_ids={1})
+        kept_ids = {t["id"] for t in kept}
+        assert 1 in kept_ids   # protected — never removed despite matching setup pattern
+        assert 2 in kept_ids
+
+    def test_removed_entries_have_reason(self):
+        from ai_cto.agents.task_manager import _filter_tasks
+        tasks = [self._t(1, "Setup and Install", ["package.json"])]
+        kept, removed = _filter_tasks(tasks, protected_ids=set())
+        assert len(removed) == 1
+        assert "reason" in removed[0]
+        assert removed[0]["reason"]
+
+    def test_all_coding_tasks_kept(self):
+        from ai_cto.agents.task_manager import _filter_tasks
+        tasks = [
+            self._t(1, "Build REST API", ["api/routes.py"]),
+            self._t(2, "Implement Data Models", ["models/user.py"]),
+            self._t(3, "Add Business Logic", ["services/billing.py"]),
+        ]
+        kept, removed = _filter_tasks(tasks, protected_ids=set())
+        assert len(kept) == 3
+        assert len(removed) == 0
+
+    def test_duplicate_outputs_removed(self):
+        from ai_cto.agents.task_manager import _filter_tasks
+        tasks = [
+            self._t(1, "Build API", ["api/routes.py", "api/models.py"]),
+            self._t(2, "Also Build API", ["api/routes.py", "api/models.py"]),  # exact dup
+        ]
+        kept, removed = _filter_tasks(tasks, protected_ids=set())
+        assert len(kept) == 1
+        assert kept[0]["id"] == 1
+        assert len(removed) == 1
+
+    # ── _repair_dependencies ────────────────────────────────────────────────
+
+    def test_repair_removes_broken_deps(self):
+        from ai_cto.agents.task_manager import _repair_dependencies
+        tasks = [
+            {**self._t(2, "CRUD", ["controllers/task.js"]), "depends_on": [1]},  # 1 was removed
+            {**self._t(3, "Auth",  ["middlewares/auth.js"]), "depends_on": [2]},
+        ]
+        repaired = _repair_dependencies(tasks, removed_ids={1})
+        t2 = next(t for t in repaired if t["id"] == 2)
+        assert t2["depends_on"] == []    # dep on removed task 1 cleaned
+
+    def test_repair_keeps_valid_deps(self):
+        from ai_cto.agents.task_manager import _repair_dependencies
+        tasks = [
+            {**self._t(2, "CRUD", ["controllers/task.js"]), "depends_on": [3]},
+            {**self._t(3, "Schema", ["models/task.js"]), "depends_on": []},
+        ]
+        repaired = _repair_dependencies(tasks, removed_ids={1})  # 1 not in these tasks
+        t2 = next(t for t in repaired if t["id"] == 2)
+        assert t2["depends_on"] == [3]   # valid dep preserved
+
+    def test_repair_no_mutation_of_input(self):
+        from ai_cto.agents.task_manager import _repair_dependencies
+        task = {**self._t(2, "CRUD", ["app.py"]), "depends_on": [1]}
+        original_deps = list(task["depends_on"])
+        _repair_dependencies([task], removed_ids={1})
+        assert task["depends_on"] == original_deps   # input not mutated
+
+
+# ── Filter integration: end-to-end through task_manager_node ────────────────────
+
+class TestFilterIntegration:
+    """Verify the filter is wired into task_manager_node and fires automatically."""
+
+    def test_node_removes_setup_and_test_tasks(self, tmp_path, monkeypatch):
+        """The 7-task pattern seen in real Ollama runs: 3 bad + 4 good → 4 kept."""
+        monkeypatch.setattr("ai_cto.tools.file_writer.WORKSPACE_ROOT", tmp_path)
+        _mock_anthropic(monkeypatch, [
+            _llm_task(1, "Setup Project and Install Dependencies", outputs=["package.json"]),
+            _llm_task(2, "Design Database Schema",   outputs=["models/task.js"]),
+            _llm_task(3, "Implement CRUD Operations", outputs=["controllers/task.js"]),
+            _llm_task(4, "Implement User Service",   outputs=["controllers/user.js"]),
+            _llm_task(5, "Implement Authentication Middleware", outputs=["middlewares/auth.js"]),
+            _llm_task(6, "Write Unit Tests",         outputs=["tests/task.test.js"]),
+            _llm_task(7, "Dockerize the Application", outputs=["Dockerfile"]),
+        ])
+        from ai_cto.agents.task_manager import task_manager_node
+        result = task_manager_node(_state())
+        task_ids = {t["id"] for t in result["tasks"]}
+        assert task_ids == {2, 3, 4, 5}
+        assert len(result["tasks"]) == 4
+
+    def test_node_active_task_is_coding_task_not_setup(self, tmp_path, monkeypatch):
+        """After filter, active_task_id must never point to a setup or test task."""
+        monkeypatch.setattr("ai_cto.tools.file_writer.WORKSPACE_ROOT", tmp_path)
+        _mock_anthropic(monkeypatch, [
+            _llm_task(1, "Setup Project", priority=1, outputs=["package.json"]),  # filtered
+            _llm_task(2, "Build Models",  priority=2, outputs=["models.py"]),
+        ])
+        from ai_cto.agents.task_manager import task_manager_node
+        result = task_manager_node(_state())
+        assert result["active_task_id"] == 2   # setup removed; models task is active
+
+    def test_node_active_task_none_when_all_filtered(self, tmp_path, monkeypatch):
+        """If every LLM task is filtered, active_task_id must be None."""
+        monkeypatch.setattr("ai_cto.tools.file_writer.WORKSPACE_ROOT", tmp_path)
+        _mock_anthropic(monkeypatch, [
+            _llm_task(1, "Setup Environment",   outputs=["package.json"]),
+            _llm_task(2, "Write Tests",         outputs=["tests/app.test.js"]),
+            _llm_task(3, "Deploy with Docker",  outputs=["Dockerfile"]),
+        ])
+        from ai_cto.agents.task_manager import task_manager_node
+        result = task_manager_node(_state())
+        assert result["tasks"] == []
+        assert result["active_task_id"] is None
